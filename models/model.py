@@ -475,6 +475,10 @@ class TemporalAttentionDecoderLayer(nn.Module):
         return x
 
 
+class TemporalAttentionEncoderLayer(TemporalAttentionDecoderLayer):
+    pass
+
+
 class Direction(nn.Module):
     def __init__(self, motion_dim):
         super(Direction, self).__init__()
@@ -520,20 +524,43 @@ class Model(nn.Module):
         for i in range(self.num_anchor):
             self.anchor_input[f'anchor_{i}'] = nn.Parameter(torch.FloatTensor(1, 128).uniform_(-stdv_anchor, stdv_anchor))
         
+        def _num_heads(dim):
+            if dim < 32:
+                return 1
+            return max(1, dim // 32)
 
-        self.st_gcnns_encoder_past_motion=nn.ModuleList()
-        #0
-        self.st_gcnns_encoder_past_motion.append(ST_GCNN_layer(input_channels,128,[3,1],1,self.output_len,
-                                           joints_to_consider,st_gcnn_dropout,pose_info=pose_info))
-        #1
-        self.st_gcnns_encoder_past_motion.append(ST_GCNN_layer(128,64,[3,1],1,self.output_len,
-                                               joints_to_consider,st_gcnn_dropout, version=1, pose_info=pose_info))
-        #2
-        self.st_gcnns_encoder_past_motion.append(ST_GCNN_layer(64,128,[3,1],1,self.output_len,
-                                               joints_to_consider,st_gcnn_dropout, version=1, pose_info=pose_info))
-        #3
-        self.st_gcnns_encoder_past_motion.append(ST_GCNN_layer(128,128,[3,1],1,self.output_len,
-                                               joints_to_consider,st_gcnn_dropout, pose_info=pose_info))  
+        self.encoder_attention_layers = nn.ModuleList(
+            [
+                TemporalAttentionEncoderLayer(
+                    input_channels,
+                    128,
+                    time_dim=self.output_len,
+                    num_heads=_num_heads(128),
+                    dropout=st_gcnn_dropout,
+                ),
+                TemporalAttentionEncoderLayer(
+                    128,
+                    64,
+                    time_dim=self.output_len,
+                    num_heads=_num_heads(64),
+                    dropout=st_gcnn_dropout,
+                ),
+                TemporalAttentionEncoderLayer(
+                    64,
+                    128,
+                    time_dim=self.output_len,
+                    num_heads=_num_heads(128),
+                    dropout=st_gcnn_dropout,
+                ),
+                TemporalAttentionEncoderLayer(
+                    128,
+                    128,
+                    time_dim=self.output_len,
+                    num_heads=_num_heads(128),
+                    dropout=st_gcnn_dropout,
+                ),
+            ]
+        )
         
         self.st_gcnns_compress=nn.ModuleList()
         #0
@@ -556,11 +583,6 @@ class Model(nn.Module):
        
         
         self.direction = Direction(motion_dim=self.num_D)
-        
-        def _num_heads(dim):
-            if dim < 32:
-                return 1
-            return max(1, dim // 32)
 
         self.st_gcnns_decoder = nn.ModuleList(
             [
@@ -623,8 +645,8 @@ class Model(nn.Module):
         x_pad = torch.matmul(dct_m[:self.output_len], x_padding[:, idx_pad, :]).reshape([N, -1, C, V]).permute(0, 2, 1, 3)
         x = x_pad # [N, C, T, V]
         
-        for gcn in (self.st_gcnns_encoder_past_motion): #0-3 layer
-            x = gcn(x)
+        for layer in self.encoder_attention_layers:
+            x = layer(x)
         N, C, T, V = x.shape
         
         return x

@@ -103,6 +103,13 @@ class ST_GCNN_layer_down(nn.Module):
 def count_parameters(model):
     return sum(p.numel() for p in model.parameters() if p.requires_grad)
 
+
+def _default_num_heads(dim):
+    if dim < 32:
+        return 1
+    return max(1, dim // 32)
+
+
 class EqualLinear(nn.Module):
     def __init__(self, in_dim, out_dim, bias=True, bias_init=0, lr_mul=1, activation=None):
         super().__init__()
@@ -475,6 +482,33 @@ class TemporalAttentionDecoderLayer(nn.Module):
         return x
 
 
+class Transformer1D(nn.Module):
+    def __init__(self, dim, num_heads, dropout):
+        super().__init__()
+        self.attn = nn.MultiheadAttention(embed_dim=dim, num_heads=num_heads, dropout=dropout, batch_first=True)
+        self.norm1 = nn.LayerNorm(dim)
+        self.norm2 = nn.LayerNorm(dim)
+        self.ffn = nn.Sequential(
+            nn.Linear(dim, dim * 4),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(dim * 4, dim),
+            nn.Dropout(dropout),
+        )
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x, attn_mask=None):
+        residual = x
+        attn_input = self.norm1(x)
+        attn_output, _ = self.attn(attn_input, attn_input, attn_input, attn_mask=attn_mask, need_weights=False)
+        x = residual + self.dropout(attn_output)
+        residual = x
+        ffn_input = self.norm2(x)
+        ffn_output = self.ffn(ffn_input)
+        x = residual + ffn_output
+        return x
+
+
 class Direction(nn.Module):
     def __init__(self, motion_dim):
         super(Direction, self).__init__()
@@ -521,19 +555,22 @@ class Model(nn.Module):
             self.anchor_input[f'anchor_{i}'] = nn.Parameter(torch.FloatTensor(1, 128).uniform_(-stdv_anchor, stdv_anchor))
         
 
-        self.st_gcnns_encoder_past_motion=nn.ModuleList()
-        #0
-        self.st_gcnns_encoder_past_motion.append(ST_GCNN_layer(input_channels,128,[3,1],1,self.output_len,
-                                           joints_to_consider,st_gcnn_dropout,pose_info=pose_info))
-        #1
-        self.st_gcnns_encoder_past_motion.append(ST_GCNN_layer(128,64,[3,1],1,self.output_len,
-                                               joints_to_consider,st_gcnn_dropout, version=1, pose_info=pose_info))
-        #2
-        self.st_gcnns_encoder_past_motion.append(ST_GCNN_layer(64,128,[3,1],1,self.output_len,
-                                               joints_to_consider,st_gcnn_dropout, version=1, pose_info=pose_info))
-        #3
-        self.st_gcnns_encoder_past_motion.append(ST_GCNN_layer(128,128,[3,1],1,self.output_len,
-                                               joints_to_consider,st_gcnn_dropout, pose_info=pose_info))  
+        self.encoder_dims = [input_channels, 128, 64, 128, 128]
+        self.encoder_depth = len(self.encoder_dims) - 1
+        self.encoder_projections = nn.ModuleList()
+        self.transformer_t = nn.ModuleList()
+        self.transformer_s = nn.ModuleList()
+        for in_c, out_c in zip(self.encoder_dims[:-1], self.encoder_dims[1:]):
+            self.encoder_projections.append(
+                nn.Sequential(
+                    nn.Conv2d(in_c, out_c, kernel_size=1),
+                    nn.BatchNorm2d(out_c),
+                    nn.PReLU(),
+                )
+            )
+            heads = _default_num_heads(out_c)
+            self.transformer_t.append(Transformer1D(out_c, heads, st_gcnn_dropout))
+            self.transformer_s.append(Transformer1D(out_c, heads, st_gcnn_dropout))
         
         self.st_gcnns_compress=nn.ModuleList()
         #0
@@ -557,39 +594,34 @@ class Model(nn.Module):
         
         self.direction = Direction(motion_dim=self.num_D)
         
-        def _num_heads(dim):
-            if dim < 32:
-                return 1
-            return max(1, dim // 32)
-
         self.st_gcnns_decoder = nn.ModuleList(
             [
                 TemporalAttentionDecoderLayer(
                     128 + 256,
                     128,
                     time_dim=self.output_len,
-                    num_heads=_num_heads(128),
+                    num_heads=_default_num_heads(128),
                     dropout=st_gcnn_dropout,
                 ),
                 TemporalAttentionDecoderLayer(
                     128,
                     64,
                     time_dim=self.output_len,
-                    num_heads=_num_heads(64),
+                    num_heads=_default_num_heads(64),
                     dropout=st_gcnn_dropout,
                 ),
                 TemporalAttentionDecoderLayer(
                     64,
                     128,
                     time_dim=self.output_len,
-                    num_heads=_num_heads(128),
+                    num_heads=_default_num_heads(128),
                     dropout=st_gcnn_dropout,
                 ),
                 TemporalAttentionDecoderLayer(
                     128,
                     input_channels,
                     time_dim=self.output_len,
-                    num_heads=_num_heads(input_channels),
+                    num_heads=_default_num_heads(input_channels),
                     dropout=st_gcnn_dropout,
                 ),
             ]
@@ -622,11 +654,21 @@ class Model(nn.Module):
         # [bs, t_full, C*V] -> [bs, t_full, C*V]
         x_pad = torch.matmul(dct_m[:self.output_len], x_padding[:, idx_pad, :]).reshape([N, -1, C, V]).permute(0, 2, 1, 3)
         x = x_pad # [N, C, T, V]
-        
-        for gcn in (self.st_gcnns_encoder_past_motion): #0-3 layer
-            x = gcn(x)
+
+        for i in range(self.encoder_depth):
+            x = self.encoder_projections[i](x)
+            b, c, t, v = x.shape
+
+            x_time = x.permute(0, 3, 2, 1).contiguous().view(b * v, t, c)
+            x_time = self.transformer_t[i](x_time)
+            x = x_time.view(b, v, t, c).permute(0, 3, 2, 1).contiguous()
+
+            x_space = x.permute(0, 2, 3, 1).contiguous().view(b * t, v, c)
+            x_space = self.transformer_s[i](x_space)
+            x = x_space.view(b, t, v, c).permute(0, 3, 1, 2).contiguous()
+
         N, C, T, V = x.shape
-        
+
         return x
 
     def decoding(self,z,condition=None):

@@ -545,22 +545,52 @@ class Model(nn.Module):
         
         self.direction = Direction(motion_dim=self.num_D)
         
-        self.decoder_dims = [128 + 256, 128, 64, 128, input_channels]
-        self.decoder_depth = len(self.decoder_dims) - 1
-        self.decoder_projections = nn.ModuleList()
-        self.decoder_transformer_t = nn.ModuleList()
-        self.decoder_transformer_s = nn.ModuleList()
-        for in_c, out_c in zip(self.decoder_dims[:-1], self.decoder_dims[1:]):
-            self.decoder_projections.append(
-                nn.Sequential(
-                    nn.Conv2d(in_c, out_c, kernel_size=1),
-                    nn.BatchNorm2d(out_c),
-                    nn.PReLU(),
-                )
-            )
-            heads = _default_num_heads(out_c)
-            self.decoder_transformer_t.append(Transformer1D(out_c, heads, st_gcnn_dropout))
-            self.decoder_transformer_s.append(Transformer1D(out_c, heads, st_gcnn_dropout))
+        self.st_gcnns_decoder = nn.ModuleList(
+            [
+                ST_GCNN_layer(
+                    128 + 256,
+                    128,
+                    [3, 1],
+                    1,
+                    self.output_len,
+                    joints_to_consider,
+                    st_gcnn_dropout,
+                    version=1,
+                    pose_info=pose_info,
+                ),
+                ST_GCNN_layer(
+                    128,
+                    64,
+                    [3, 1],
+                    1,
+                    self.output_len,
+                    joints_to_consider,
+                    st_gcnn_dropout,
+                    pose_info=pose_info,
+                ),
+                ST_GCNN_layer(
+                    64,
+                    128,
+                    [3, 1],
+                    1,
+                    self.output_len,
+                    joints_to_consider,
+                    st_gcnn_dropout,
+                    version=1,
+                    pose_info=pose_info,
+                ),
+                ST_GCNN_layer(
+                    128,
+                    input_channels,
+                    [3, 1],
+                    1,
+                    self.output_len,
+                    joints_to_consider,
+                    st_gcnn_dropout,
+                    pose_info=pose_info,
+                ),
+            ]
+        )
         
 
         self.dct_m, self.idct_m = self.get_dct_matrix(self.t_his + self.t_pred)
@@ -621,17 +651,8 @@ class Model(nn.Module):
         if condition_p.shape[0] != z.shape[0]:
             condition_p = condition_p.repeat_interleave(self.nk, dim=0)
         
-        for i in range(self.decoder_depth):
-            z = self.decoder_projections[i](z)
-            b, c, t, v = z.shape
-
-            z_time = z.permute(0, 3, 2, 1).contiguous().view(b * v, t, c)
-            z_time = self.decoder_transformer_t[i](z_time)
-            z = z_time.view(b, v, t, c).permute(0, 3, 2, 1).contiguous()
-
-            z_space = z.permute(0, 2, 3, 1).contiguous().view(b * t, v, c)
-            z_space = self.decoder_transformer_s[i](z_space)
-            z = z_space.view(b, t, v, c).permute(0, 3, 1, 2).contiguous()
+        for gcn in self.st_gcnns_decoder:
+            z = gcn(z)
         
         output = (z + condition_p)
         N, C, N_fre, V = output.shape 

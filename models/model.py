@@ -433,55 +433,6 @@ class ST_GCNN_layer(nn.Module):
         return x
 
 
-class TemporalAttentionDecoderLayer(nn.Module):
-    def __init__(
-        self,
-        in_channels,
-        out_channels,
-        time_dim,
-        num_heads=4,
-        dropout=0.1,
-    ):
-        super().__init__()
-        self.in_channels = in_channels
-        self.out_channels = out_channels
-        self.time_dim = time_dim
-        self.num_heads = num_heads
-        if in_channels == out_channels:
-            self.input_proj = nn.Identity()
-        else:
-            self.input_proj = nn.Linear(in_channels, out_channels)
-
-        self.attn = nn.MultiheadAttention(
-            embed_dim=out_channels, num_heads=num_heads, dropout=dropout, batch_first=True
-        )
-        self.norm1 = nn.LayerNorm(out_channels)
-        self.norm2 = nn.LayerNorm(out_channels)
-        self.ffn = nn.Sequential(
-            nn.Linear(out_channels, out_channels * 4),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(out_channels * 4, out_channels),
-            nn.Dropout(dropout),
-        )
-        self.dropout = nn.Dropout(dropout)
-        self.time_pos = nn.Parameter(torch.zeros(1, time_dim, out_channels))
-        nn.init.trunc_normal_(self.time_pos, std=0.02)
-
-    def forward(self, x):
-        n, c, t, v = x.shape
-        x = x.permute(0, 3, 2, 1).contiguous().view(n * v, t, c)
-        x = self.input_proj(x)
-        pos = self.time_pos[:, :t, :]
-        attn_input = self.norm1(x + pos)
-        attn_output, _ = self.attn(attn_input, attn_input, attn_input)
-        x = x + self.dropout(attn_output)
-        ffn_output = self.ffn(self.norm2(x))
-        x = x + ffn_output
-        x = x.view(n, v, t, self.out_channels).permute(0, 3, 2, 1).contiguous()
-        return x
-
-
 class Transformer1D(nn.Module):
     def __init__(self, dim, num_heads, dropout):
         super().__init__()
@@ -594,38 +545,22 @@ class Model(nn.Module):
         
         self.direction = Direction(motion_dim=self.num_D)
         
-        self.st_gcnns_decoder = nn.ModuleList(
-            [
-                TemporalAttentionDecoderLayer(
-                    128 + 256,
-                    128,
-                    time_dim=self.output_len,
-                    num_heads=_default_num_heads(128),
-                    dropout=st_gcnn_dropout,
-                ),
-                TemporalAttentionDecoderLayer(
-                    128,
-                    64,
-                    time_dim=self.output_len,
-                    num_heads=_default_num_heads(64),
-                    dropout=st_gcnn_dropout,
-                ),
-                TemporalAttentionDecoderLayer(
-                    64,
-                    128,
-                    time_dim=self.output_len,
-                    num_heads=_default_num_heads(128),
-                    dropout=st_gcnn_dropout,
-                ),
-                TemporalAttentionDecoderLayer(
-                    128,
-                    input_channels,
-                    time_dim=self.output_len,
-                    num_heads=_default_num_heads(input_channels),
-                    dropout=st_gcnn_dropout,
-                ),
-            ]
-        )
+        self.decoder_dims = [128 + 256, 128, 64, 128, input_channels]
+        self.decoder_depth = len(self.decoder_dims) - 1
+        self.decoder_projections = nn.ModuleList()
+        self.decoder_transformer_t = nn.ModuleList()
+        self.decoder_transformer_s = nn.ModuleList()
+        for in_c, out_c in zip(self.decoder_dims[:-1], self.decoder_dims[1:]):
+            self.decoder_projections.append(
+                nn.Sequential(
+                    nn.Conv2d(in_c, out_c, kernel_size=1),
+                    nn.BatchNorm2d(out_c),
+                    nn.PReLU(),
+                )
+            )
+            heads = _default_num_heads(out_c)
+            self.decoder_transformer_t.append(Transformer1D(out_c, heads, st_gcnn_dropout))
+            self.decoder_transformer_s.append(Transformer1D(out_c, heads, st_gcnn_dropout))
         
 
         self.dct_m, self.idct_m = self.get_dct_matrix(self.t_his + self.t_pred)
@@ -686,8 +621,17 @@ class Model(nn.Module):
         if condition_p.shape[0] != z.shape[0]:
             condition_p = condition_p.repeat_interleave(self.nk, dim=0)
         
-        for gcn in (self.st_gcnns_decoder): #0-3 layer
-            z = gcn(z)
+        for i in range(self.decoder_depth):
+            z = self.decoder_projections[i](z)
+            b, c, t, v = z.shape
+
+            z_time = z.permute(0, 3, 2, 1).contiguous().view(b * v, t, c)
+            z_time = self.decoder_transformer_t[i](z_time)
+            z = z_time.view(b, v, t, c).permute(0, 3, 2, 1).contiguous()
+
+            z_space = z.permute(0, 2, 3, 1).contiguous().view(b * t, v, c)
+            z_space = self.decoder_transformer_s[i](z_space)
+            z = z_space.view(b, t, v, c).permute(0, 3, 1, 2).contiguous()
         
         output = (z + condition_p)
         N, C, N_fre, V = output.shape 

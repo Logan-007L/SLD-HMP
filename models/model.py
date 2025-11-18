@@ -426,6 +426,101 @@ class ST_GCNN_layer(nn.Module):
         return x
 
 
+class SpatialGraphAttention(nn.Module):
+    def __init__(self, channels, num_heads=4, attn_dropout=0.1):
+        super().__init__()
+        num_heads = max(1, min(num_heads, channels))
+        if channels % num_heads != 0:
+            for candidate in range(num_heads, 0, -1):
+                if channels % candidate == 0:
+                    num_heads = candidate
+                    break
+        self.num_heads = num_heads
+        self.head_dim = channels // self.num_heads
+        self.scale = self.head_dim ** -0.5
+        self.q_proj = nn.Conv2d(channels, channels, kernel_size=1)
+        self.k_proj = nn.Conv2d(channels, channels, kernel_size=1)
+        self.v_proj = nn.Conv2d(channels, channels, kernel_size=1)
+        self.out_proj = nn.Conv2d(channels, channels, kernel_size=1)
+        self.attn_drop = nn.Dropout(attn_dropout)
+        self.proj_drop = nn.Dropout(attn_dropout)
+
+    def forward(self, x):
+        N, C, T, V = x.shape
+        q = self.q_proj(x).view(N, self.num_heads, self.head_dim, T, V).permute(0, 1, 3, 4, 2)
+        k = self.k_proj(x).view(N, self.num_heads, self.head_dim, T, V).permute(0, 1, 3, 4, 2)
+        v = self.v_proj(x).view(N, self.num_heads, self.head_dim, T, V).permute(0, 1, 3, 4, 2)
+
+        attn = torch.einsum('nhtvd,nhtwd->nhtvw', q, k) * self.scale
+        attn = torch.softmax(attn, dim=-1)
+        attn = self.attn_drop(attn)
+
+        out = torch.einsum('nhtvw,nhtwd->nhtvd', attn, v)
+        out = out.permute(0, 1, 4, 2, 3).contiguous().view(N, -1, T, V)
+        out = self.out_proj(out)
+        return self.proj_drop(out)
+
+
+class ST_GAT_layer(nn.Module):
+    def __init__(self,
+                 in_channels,
+                 out_channels,
+                 kernel_size,
+                 stride,
+                 time_dim,
+                 joints_dim,
+                 dropout,
+                 bias=True,
+                 version=0,
+                 pose_info=None,
+                 num_heads=4):
+
+        super().__init__()
+        self.kernel_size = kernel_size
+        assert self.kernel_size[0] % 2 == 1
+        assert self.kernel_size[1] % 2 == 1
+        padding = ((self.kernel_size[0] - 1) // 2,(self.kernel_size[1] - 1) // 2)
+
+        if version == 0:
+            self.gcn = ConvTemporalGraphical(time_dim, joints_dim)
+        elif version == 1:
+            self.gcn = ConvTemporalGraphicalV1(time_dim, joints_dim, pose_info=pose_info)
+        else:
+            raise ValueError(f'Unsupported version {version} for ST_GAT_layer')
+
+        self.spatial_attention = SpatialGraphAttention(in_channels, num_heads=num_heads, attn_dropout=dropout)
+
+        self.tcn = nn.Sequential(
+            nn.Conv2d(
+                in_channels,
+                out_channels,
+                (self.kernel_size[0], self.kernel_size[1]),
+                (stride, stride),
+                padding,
+                bias=bias,
+            ),
+            nn.BatchNorm2d(out_channels),
+            nn.Dropout(dropout, inplace=True),
+        )
+
+        if stride != 1 or in_channels != out_channels:
+            self.residual = nn.Sequential(
+                nn.Conv2d(in_channels, out_channels, kernel_size=1, stride=(1, 1), bias=bias),
+                nn.BatchNorm2d(out_channels),
+            )
+        else:
+            self.residual = nn.Identity()
+
+        self.prelu = nn.PReLU()
+
+    def forward(self, x):
+        res = self.residual(x)
+        x_physical = self.gcn(x)
+        x_semantic = self.spatial_attention(x)
+        x_fused = x_physical + x_semantic
+        x_out = self.tcn(x_fused)
+        return self.prelu(x_out + res)
+
 
 class Direction(nn.Module):
     def __init__(self, motion_dim):
@@ -481,10 +576,10 @@ class Model(nn.Module):
         self.st_gcnns_encoder_past_motion.append(ST_GCNN_layer(128,64,[3,1],1,self.output_len,
                                                joints_to_consider,st_gcnn_dropout, version=1, pose_info=pose_info))
         #2
-        self.st_gcnns_encoder_past_motion.append(ST_GCNN_layer(64,128,[3,1],1,self.output_len,
+        self.st_gcnns_encoder_past_motion.append(ST_GAT_layer(64,128,[3,1],1,self.output_len,
                                                joints_to_consider,st_gcnn_dropout, version=1, pose_info=pose_info))
         #3
-        self.st_gcnns_encoder_past_motion.append(ST_GCNN_layer(128,128,[3,1],1,self.output_len,
+        self.st_gcnns_encoder_past_motion.append(ST_GAT_layer(128,128,[3,1],1,self.output_len,
                                                joints_to_consider,st_gcnn_dropout, pose_info=pose_info))  
         
         self.st_gcnns_compress=nn.ModuleList()

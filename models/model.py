@@ -426,54 +426,6 @@ class ST_GCNN_layer(nn.Module):
         return x
 
 
-class TemporalAttentionDecoderLayer(nn.Module):
-    def __init__(
-        self,
-        in_channels,
-        out_channels,
-        time_dim,
-        num_heads=4,
-        dropout=0.1,
-    ):
-        super().__init__()
-        self.in_channels = in_channels
-        self.out_channels = out_channels
-        self.time_dim = time_dim
-        self.num_heads = num_heads
-        if in_channels == out_channels:
-            self.input_proj = nn.Identity()
-        else:
-            self.input_proj = nn.Linear(in_channels, out_channels)
-
-        self.attn = nn.MultiheadAttention(
-            embed_dim=out_channels, num_heads=num_heads, dropout=dropout, batch_first=True
-        )
-        self.norm1 = nn.LayerNorm(out_channels)
-        self.norm2 = nn.LayerNorm(out_channels)
-        self.ffn = nn.Sequential(
-            nn.Linear(out_channels, out_channels * 4),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(out_channels * 4, out_channels),
-            nn.Dropout(dropout),
-        )
-        self.dropout = nn.Dropout(dropout)
-        self.time_pos = nn.Parameter(torch.zeros(1, time_dim, out_channels))
-        nn.init.trunc_normal_(self.time_pos, std=0.02)
-
-    def forward(self, x):
-        n, c, t, v = x.shape
-        x = x.permute(0, 3, 2, 1).contiguous().view(n * v, t, c)
-        x = self.input_proj(x)
-        pos = self.time_pos[:, :t, :]
-        attn_input = self.norm1(x + pos)
-        attn_output, _ = self.attn(attn_input, attn_input, attn_input)
-        x = x + self.dropout(attn_output)
-        ffn_output = self.ffn(self.norm2(x))
-        x = x + ffn_output
-        x = x.view(n, v, t, self.out_channels).permute(0, 3, 2, 1).contiguous()
-        return x
-
 
 class Direction(nn.Module):
     def __init__(self, motion_dim):
@@ -557,43 +509,24 @@ class Model(nn.Module):
         
         self.direction = Direction(motion_dim=self.num_D)
         
-        def _num_heads(dim):
-            if dim < 32:
-                return 1
-            return max(1, dim // 32)
+        self.st_gcnns_decoder=nn.ModuleList()
 
-        self.st_gcnns_decoder = nn.ModuleList(
-            [
-                TemporalAttentionDecoderLayer(
-                    128 + 256,
-                    128,
-                    time_dim=self.output_len,
-                    num_heads=_num_heads(128),
-                    dropout=st_gcnn_dropout,
-                ),
-                TemporalAttentionDecoderLayer(
-                    128,
-                    64,
-                    time_dim=self.output_len,
-                    num_heads=_num_heads(64),
-                    dropout=st_gcnn_dropout,
-                ),
-                TemporalAttentionDecoderLayer(
-                    64,
-                    128,
-                    time_dim=self.output_len,
-                    num_heads=_num_heads(128),
-                    dropout=st_gcnn_dropout,
-                ),
-                TemporalAttentionDecoderLayer(
-                    128,
-                    input_channels,
-                    time_dim=self.output_len,
-                    num_heads=_num_heads(input_channels),
-                    dropout=st_gcnn_dropout,
-                ),
-            ]
-        )
+        #4
+        self.st_gcnns_decoder.append(ST_GCNN_layer(128+256,128,[3,1],1,self.output_len,
+                                               joints_to_consider,st_gcnn_dropout, version=1, pose_info=pose_info)) 
+        self.st_gcnns_decoder[-1].gcn.A = self.st_gcnns_encoder_past_motion[-2].gcn.A
+        
+        #5
+        self.st_gcnns_decoder.append(ST_GCNN_layer(128,64,[3,1],1,self.output_len,
+                                               joints_to_consider,st_gcnn_dropout, pose_info=pose_info))   
+        self.st_gcnns_decoder[-1].gcn.A = self.st_gcnns_encoder_past_motion[-1].gcn.A
+        #6
+        self.st_gcnns_decoder.append(ST_GCNN_layer(64,128,[3,1],1,self.output_len,
+                                               joints_to_consider,st_gcnn_dropout, version=1, pose_info=pose_info))
+        self.st_gcnns_decoder[-1].gcn.A = self.st_gcnns_decoder[-3].gcn.A
+        #7
+        self.st_gcnns_decoder.append(ST_GCNN_layer(128,input_channels,[3,1],1,self.output_len,
+                                               joints_to_consider,st_gcnn_dropout, pose_info=pose_info))
         
 
         self.dct_m, self.idct_m = self.get_dct_matrix(self.t_his + self.t_pred)
@@ -691,6 +624,3 @@ class Model(nn.Module):
             dct_m = torch.from_numpy(dct_m)
             idct_m = torch.from_numpy(idct_m)
         return dct_m, idct_m  
-
-
-

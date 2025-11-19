@@ -132,6 +132,21 @@ class EqualLinear(nn.Module):
     def __repr__(self):
         return (f'{self.__class__.__name__}({self.weight.shape[1]}, {self.weight.shape[0]})')
 
+class AdaIN2d(nn.Module):
+    def __init__(self, num_features, style_dim, eps=1e-5):
+        super().__init__()
+        self.norm = nn.InstanceNorm2d(num_features, affine=False, eps=eps)
+        self.style_scale = EqualLinear(style_dim, num_features)
+        self.style_shift = EqualLinear(style_dim, num_features)
+
+    def forward(self, x, style_code):
+        if style_code.dim() == 1:
+            style_code = style_code.unsqueeze(0)
+        gamma = self.style_scale(style_code).unsqueeze(-1).unsqueeze(-1)
+        beta = self.style_shift(style_code).unsqueeze(-1).unsqueeze(-1)
+        normalized = self.norm(x)
+        return gamma * normalized + beta
+
 class GraphConv(nn.Module):
     """
         adapted from : https://github.com/tkipf/gcn/blob/92600c39797c2bfb61a508e52b88fb554df30177/gcn/layers.py#L132
@@ -522,6 +537,37 @@ class ST_GAT_layer(nn.Module):
         return self.prelu(x_out + res)
 
 
+class StyledDecoderLayer(nn.Module):
+    def __init__(self,
+                 in_channels,
+                 out_channels,
+                 kernel_size,
+                 stride,
+                 time_dim,
+                 joints_dim,
+                 dropout,
+                 style_dim,
+                 bias=True,
+                 version=0,
+                 pose_info=None):
+        super().__init__()
+        self.layer = ST_GCNN_layer(in_channels,
+                                   out_channels,
+                                   kernel_size,
+                                   stride,
+                                   time_dim,
+                                   joints_dim,
+                                   dropout,
+                                   bias=bias,
+                                   version=version,
+                                   pose_info=pose_info)
+        self.adain = AdaIN2d(out_channels, style_dim)
+
+    def forward(self, x, style_code):
+        x = self.layer(x)
+        return self.adain(x, style_code)
+
+
 class Direction(nn.Module):
     def __init__(self, motion_dim):
         super(Direction, self).__init__()
@@ -603,25 +649,24 @@ class Model(nn.Module):
        
         
         self.direction = Direction(motion_dim=self.num_D)
+        self.style_dim = self.direction.weight.shape[0]
         
-        self.st_gcnns_decoder=nn.ModuleList()
+        self.decoder_layers = nn.ModuleList()
 
-        #4
-        self.st_gcnns_decoder.append(ST_GCNN_layer(128+256,128,[3,1],1,self.output_len,
-                                               joints_to_consider,st_gcnn_dropout, version=1, pose_info=pose_info)) 
-        self.st_gcnns_decoder[-1].gcn.A = self.st_gcnns_encoder_past_motion[-2].gcn.A
+        self.decoder_layers.append(StyledDecoderLayer(128,128,[3,1],1,self.output_len,
+                                                joints_to_consider,st_gcnn_dropout, style_dim=self.style_dim, version=1, pose_info=pose_info)) 
+        self.decoder_layers[0].layer.gcn.A = self.st_gcnns_encoder_past_motion[-2].gcn.A
         
-        #5
-        self.st_gcnns_decoder.append(ST_GCNN_layer(128,64,[3,1],1,self.output_len,
-                                               joints_to_consider,st_gcnn_dropout, pose_info=pose_info))   
-        self.st_gcnns_decoder[-1].gcn.A = self.st_gcnns_encoder_past_motion[-1].gcn.A
-        #6
-        self.st_gcnns_decoder.append(ST_GCNN_layer(64,128,[3,1],1,self.output_len,
-                                               joints_to_consider,st_gcnn_dropout, version=1, pose_info=pose_info))
-        self.st_gcnns_decoder[-1].gcn.A = self.st_gcnns_decoder[-3].gcn.A
-        #7
-        self.st_gcnns_decoder.append(ST_GCNN_layer(128,input_channels,[3,1],1,self.output_len,
-                                               joints_to_consider,st_gcnn_dropout, pose_info=pose_info))
+        self.decoder_layers.append(StyledDecoderLayer(128,64,[3,1],1,self.output_len,
+                                                joints_to_consider,st_gcnn_dropout, style_dim=self.style_dim, pose_info=pose_info))   
+        self.decoder_layers[1].layer.gcn.A = self.st_gcnns_encoder_past_motion[-1].gcn.A
+
+        self.decoder_layers.append(StyledDecoderLayer(64,128,[3,1],1,self.output_len,
+                                                joints_to_consider,st_gcnn_dropout, style_dim=self.style_dim, version=1, pose_info=pose_info))
+        self.decoder_layers[2].layer.gcn.A = self.decoder_layers[0].layer.gcn.A
+
+        self.decoder_layers.append(StyledDecoderLayer(128,input_channels,[3,1],1,self.output_len,
+                                                joints_to_consider,st_gcnn_dropout, style_dim=self.style_dim, pose_info=pose_info))
         
 
         self.dct_m, self.idct_m = self.get_dct_matrix(self.t_his + self.t_pred)
@@ -657,8 +702,10 @@ class Model(nn.Module):
         
         return x
 
-    def decoding(self,z,condition=None):
+    def decoding(self,z,condition=None,style=None):
         idct_m = self.idct_m.to(z.device)
+        if style is None:
+            raise ValueError('Style code must be provided for decoding with AdaIN.')
    
         condition = condition.view(condition.shape[0], condition.shape[1], -1, 3).permute(1, 3, 0, 2) #(T_his, bs, Num_Joints, 3) -> [bs, t_full, 3, Num_joints]
         y_condition = torch.zeros((condition.shape[0], condition.shape[1], self.t_pred, condition.shape[3])).to(condition.device) 
@@ -672,8 +719,8 @@ class Model(nn.Module):
         if condition_p.shape[0] != z.shape[0]:
             condition_p = condition_p.repeat_interleave(self.nk, dim=0)
         
-        for gcn in (self.st_gcnns_decoder): #0-3 layer
-            z = gcn(z)
+        for layer in self.decoder_layers:
+            z = layer(z, style)
         
         output = (z + condition_p)
         N, C, N_fre, V = output.shape 
@@ -697,11 +744,8 @@ class Model(nn.Module):
         alpha = self.down_fc(z1)
         directions = self.direction(alpha)
         
-        N, C, T, V = z.shape
-        feature = torch.cat((directions.unsqueeze(2).unsqueeze(3).repeat(1, 1, T, V),z),dim=1)
-
-        
-        outputs = self.decoding(feature, x)
+        feature = z
+        outputs = self.decoding(feature, x, directions)
        
         return outputs , feature, feature
     

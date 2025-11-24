@@ -457,10 +457,12 @@ class Model(nn.Module):
                  joints_to_consider,
                  pose_info):
         super(Model, self).__init__()
+        self.input_channels = input_channels
         self.nx = nx
         self.ny = ny
         self.output_len = 20
-        self.num_joints = joints_to_consider
+        self.original_num_joints = joints_to_consider
+        self.num_joints = self.original_num_joints * 2 - 1
         self.num_D = 30
         if nx == 48:
             self.t_his = 25
@@ -479,27 +481,29 @@ class Model(nn.Module):
         self.st_gcnns_encoder_past_motion=nn.ModuleList()
         #0  input_channels = 3
         self.st_gcnns_encoder_past_motion.append(ST_GCNN_layer(input_channels,128,[3,1],1,self.output_len,
-                                           joints_to_consider,st_gcnn_dropout,pose_info=pose_info))
+                                           self.num_joints,st_gcnn_dropout,pose_info=pose_info))
         #1
         self.st_gcnns_encoder_past_motion.append(ST_GCNN_layer(128,64,[3,1],1,self.output_len,
-                                               joints_to_consider,st_gcnn_dropout, version=1, pose_info=pose_info))
+                                              self.num_joints,st_gcnn_dropout, version=1, pose_info=pose_info))
         #2
         self.st_gcnns_encoder_past_motion.append(ST_GCNN_layer(64,128,[3,1],1,self.output_len,
-                                               joints_to_consider,st_gcnn_dropout, version=1, pose_info=pose_info))
+                                              self.num_joints,st_gcnn_dropout, version=1, pose_info=pose_info))
         #3
         self.st_gcnns_encoder_past_motion.append(ST_GCNN_layer(128,128,[3,1],1,self.output_len,
-                                               joints_to_consider,st_gcnn_dropout, pose_info=pose_info))  
+                                              self.num_joints,st_gcnn_dropout, pose_info=pose_info))  
         
         self.st_gcnns_compress=nn.ModuleList()
         #0
         self.st_gcnns_compress.append(ST_GCNN_layer_down(256,512,[2,2],2,self.output_len,
-                                               joints_to_consider,st_gcnn_dropout,  pose_info=pose_info))
+                                              self.num_joints,st_gcnn_dropout,  pose_info=pose_info))
         #2
+        joints_dim_lvl1 = max(1, self.num_joints // 2)
+        joints_dim_lvl2 = max(1, self.num_joints // 4)
         self.st_gcnns_compress.append(ST_GCNN_layer_down(512,768,[2,2],2,self.output_len//2,
-                                               joints_to_consider//2,st_gcnn_dropout, pose_info=pose_info))
+                                              joints_dim_lvl1,st_gcnn_dropout, pose_info=pose_info))
 
         self.st_gcnns_compress.append(ST_GCNN_layer_down(768,1024,[2,2],2,self.output_len//4,
-                                               joints_to_consider//4,st_gcnn_dropout, pose_info=pose_info))
+                                              joints_dim_lvl2,st_gcnn_dropout, pose_info=pose_info))
        
        
         down_fc = [EqualLinear(1024, 1024,activation=True)]
@@ -516,20 +520,20 @@ class Model(nn.Module):
 
         #4
         self.st_gcnns_decoder.append(ST_GCNN_layer(128+256,128,[3,1],1,self.output_len,
-                                               joints_to_consider,st_gcnn_dropout, version=1, pose_info=pose_info)) 
+                                              self.num_joints,st_gcnn_dropout, version=1, pose_info=pose_info)) 
         self.st_gcnns_decoder[-1].gcn.A = self.st_gcnns_encoder_past_motion[-2].gcn.A
         
         #5
         self.st_gcnns_decoder.append(ST_GCNN_layer(128,64,[3,1],1,self.output_len,
-                                               joints_to_consider,st_gcnn_dropout, pose_info=pose_info))   
+                                              self.num_joints,st_gcnn_dropout, pose_info=pose_info))   
         self.st_gcnns_decoder[-1].gcn.A = self.st_gcnns_encoder_past_motion[-1].gcn.A
         #6
         self.st_gcnns_decoder.append(ST_GCNN_layer(64,128,[3,1],1,self.output_len,
-                                               joints_to_consider,st_gcnn_dropout, version=1, pose_info=pose_info))
+                                              self.num_joints,st_gcnn_dropout, version=1, pose_info=pose_info))
         self.st_gcnns_decoder[-1].gcn.A = self.st_gcnns_decoder[-3].gcn.A
         #7
         self.st_gcnns_decoder.append(ST_GCNN_layer(128,input_channels,[3,1],1,self.output_len,
-                                               joints_to_consider,st_gcnn_dropout, pose_info=pose_info))
+                                              self.num_joints,st_gcnn_dropout, pose_info=pose_info))
         
 
         self.dct_m, self.idct_m = self.get_dct_matrix(self.t_his + self.t_pred)
@@ -557,7 +561,7 @@ class Model(nn.Module):
        
         # [bs, t_full, C*V] -> [bs, t_full, C*V] 
         x_pad = torch.matmul(dct_m[:self.output_len], x_padding[:, idx_pad, :]).reshape([N, -1, C, V]).permute(0, 2, 1, 3)
-        x = x_pad # [N, C, T, V] =[16,3,20,14] 关节点= 14 ouput_len = 20
+        x = self.get_padding_traj(x_pad) # [N, C, T, V_aug]
         
         #每次变化的维度只有坐标维度
         for gcn in (self.st_gcnns_encoder_past_motion): #0-3 layer
@@ -582,6 +586,7 @@ class Model(nn.Module):
         dct_m = self.dct_m.to(condition.device) #[75, 75]
         idx_pad = list(range(self.t_his)) + [self.t_his - 1] * self.t_pred # len(idx_pad) = 75
         condition_p = torch.matmul(dct_m[:self.output_len], condition_padding[:, idx_pad, :]).reshape([N, -1, C, V]).permute(0, 2, 1, 3)#[800, 3, 20, 14]
+        condition_p = self.get_padding_traj(condition_p)
         if condition_p.shape[0] != z.shape[0]:
             condition_p = condition_p.repeat_interleave(self.nk, dim=0) #这里nk = 50, [N*50, 3, 20, 14]
         
@@ -597,6 +602,47 @@ class Model(nn.Module):
         outputs = torch.matmul(idct_m[:, :self.output_len], output).reshape([N, -1, C, V]).permute(1, 0, 3, 2).contiguous().view(-1,N,C*V)
        
         return outputs #[75, 800, 42]
+
+    def get_padding_traj(self, original_tensor):
+        """
+        对输入的骨架序列在关节点维度上插入虚拟节点（相邻节点均值），将节点数扩展为 2*N-1。
+        期望输入形状为 [B, C, T, V]。
+        """
+        if original_tensor.shape[-1] == self.num_joints:
+            return original_tensor
+
+        B, C, T, V = original_tensor.shape
+        new_num_joints = V * 2 - 1
+        padded_tensor = torch.empty(
+            B, C, T, new_num_joints,
+            device=original_tensor.device,
+            dtype=original_tensor.dtype
+        )
+        padded_tensor[..., ::2] = original_tensor
+        neighbor_avg = (original_tensor[..., :-1] + original_tensor[..., 1:]) / 2
+        padded_tensor[..., 1::2] = neighbor_avg
+        return padded_tensor
+
+    def sample_to_original_size(self, padded_tensor, original_size=None):
+        """
+        将包含虚拟节点的序列按步长 2 进行采样，还原为原始节点数量。
+        支持输入末维为关节点的 3D/4D 张量。
+        """
+        target_size = original_size or self.original_num_joints
+        if padded_tensor.shape[-1] == target_size:
+            return padded_tensor
+        max_range = target_size * 2 - 1
+        return padded_tensor[..., :max_range:2]
+
+    def _downsample_decoded_outputs(self, outputs):
+        """
+        将 decode 后的 [T, B, C*V_aug] 结果下采样回 [T, B, C*V_orig]。
+        """
+        T, B, CV = outputs.shape
+        C = self.input_channels
+        outputs = outputs.view(T, B, C, -1)
+        outputs = self.sample_to_original_size(outputs, self.original_num_joints)
+        return outputs.reshape(T, B, C * self.original_num_joints)
 
     
     def forward(self, x, z=None,epoch=None):
@@ -627,6 +673,7 @@ class Model(nn.Module):
 
         
         outputs = self.decoding(feature, x)
+        outputs = self._downsample_decoded_outputs(outputs)
        
         return outputs , feature, feature
     

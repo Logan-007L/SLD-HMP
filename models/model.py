@@ -132,21 +132,6 @@ class EqualLinear(nn.Module):
     def __repr__(self):
         return (f'{self.__class__.__name__}({self.weight.shape[1]}, {self.weight.shape[0]})')
 
-class AdaIN2d(nn.Module):
-    def __init__(self, num_features, style_dim, eps=1e-5):
-        super().__init__()
-        self.norm = nn.InstanceNorm2d(num_features, affine=False, eps=eps)
-        self.style_scale = EqualLinear(style_dim, num_features)
-        self.style_shift = EqualLinear(style_dim, num_features)
-
-    def forward(self, x, style_code):
-        if style_code.dim() == 1:
-            style_code = style_code.unsqueeze(0)
-        gamma = self.style_scale(style_code).unsqueeze(-1).unsqueeze(-1)
-        beta = self.style_shift(style_code).unsqueeze(-1).unsqueeze(-1)
-        normalized = self.norm(x)
-        return gamma * normalized + beta
-
 class GraphConv(nn.Module):
     """
         adapted from : https://github.com/tkipf/gcn/blob/92600c39797c2bfb61a508e52b88fb554df30177/gcn/layers.py#L132
@@ -441,148 +426,25 @@ class ST_GCNN_layer(nn.Module):
         return x
 
 
-class SpatialGraphAttention(nn.Module):
-    def __init__(self, channels, num_heads=4, attn_dropout=0.1):
-        super().__init__()
-        num_heads = max(1, min(num_heads, channels))
-        if channels % num_heads != 0:
-            for candidate in range(num_heads, 0, -1):
-                if channels % candidate == 0:
-                    num_heads = candidate
-                    break
-        self.num_heads = num_heads
-        self.head_dim = channels // self.num_heads
-        self.scale = self.head_dim ** -0.5
-        self.q_proj = nn.Conv2d(channels, channels, kernel_size=1)
-        self.k_proj = nn.Conv2d(channels, channels, kernel_size=1)
-        self.v_proj = nn.Conv2d(channels, channels, kernel_size=1)
-        self.out_proj = nn.Conv2d(channels, channels, kernel_size=1)
-        self.attn_drop = nn.Dropout(attn_dropout)
-        self.proj_drop = nn.Dropout(attn_dropout)
-
-    def forward(self, x):
-        N, C, T, V = x.shape
-        q = self.q_proj(x).view(N, self.num_heads, self.head_dim, T, V).permute(0, 1, 3, 4, 2)
-        k = self.k_proj(x).view(N, self.num_heads, self.head_dim, T, V).permute(0, 1, 3, 4, 2)
-        v = self.v_proj(x).view(N, self.num_heads, self.head_dim, T, V).permute(0, 1, 3, 4, 2)
-
-        attn = torch.einsum('nhtvd,nhtwd->nhtvw', q, k) * self.scale
-        attn = torch.softmax(attn, dim=-1)
-        attn = self.attn_drop(attn)
-
-        out = torch.einsum('nhtvw,nhtwd->nhtvd', attn, v)
-        out = out.permute(0, 1, 4, 2, 3).contiguous().view(N, -1, T, V)
-        out = self.out_proj(out)
-        return self.proj_drop(out)
-
-
-class ST_GAT_layer(nn.Module):
-    def __init__(self,
-                 in_channels,
-                 out_channels,
-                 kernel_size,
-                 stride,
-                 time_dim,
-                 joints_dim,
-                 dropout,
-                 bias=True,
-                 version=0,
-                 pose_info=None,
-                 num_heads=4):
-
-        super().__init__()
-        self.kernel_size = kernel_size
-        assert self.kernel_size[0] % 2 == 1
-        assert self.kernel_size[1] % 2 == 1
-        padding = ((self.kernel_size[0] - 1) // 2,(self.kernel_size[1] - 1) // 2)
-
-        if version == 0:
-            self.gcn = ConvTemporalGraphical(time_dim, joints_dim)
-        elif version == 1:
-            self.gcn = ConvTemporalGraphicalV1(time_dim, joints_dim, pose_info=pose_info)
-        else:
-            raise ValueError(f'Unsupported version {version} for ST_GAT_layer')
-
-        self.spatial_attention = SpatialGraphAttention(in_channels, num_heads=num_heads, attn_dropout=dropout)
-
-        self.tcn = nn.Sequential(
-            nn.Conv2d(
-                in_channels,
-                out_channels,
-                (self.kernel_size[0], self.kernel_size[1]),
-                (stride, stride),
-                padding,
-                bias=bias,
-            ),
-            nn.BatchNorm2d(out_channels),
-            nn.Dropout(dropout, inplace=True),
-        )
-
-        if stride != 1 or in_channels != out_channels:
-            self.residual = nn.Sequential(
-                nn.Conv2d(in_channels, out_channels, kernel_size=1, stride=(1, 1), bias=bias),
-                nn.BatchNorm2d(out_channels),
-            )
-        else:
-            self.residual = nn.Identity()
-
-        self.prelu = nn.PReLU()
-
-    def forward(self, x):
-        res = self.residual(x)
-        x_physical = self.gcn(x)
-        x_semantic = self.spatial_attention(x)
-        x_fused = x_physical + x_semantic
-        x_out = self.tcn(x_fused)
-        return self.prelu(x_out + res)
-
-
-class StyledDecoderLayer(nn.Module):
-    def __init__(self,
-                 in_channels,
-                 out_channels,
-                 kernel_size,
-                 stride,
-                 time_dim,
-                 joints_dim,
-                 dropout,
-                 style_dim,
-                 bias=True,
-                 version=0,
-                 pose_info=None):
-        super().__init__()
-        self.layer = ST_GCNN_layer(in_channels,
-                                   out_channels,
-                                   kernel_size,
-                                   stride,
-                                   time_dim,
-                                   joints_dim,
-                                   dropout,
-                                   bias=bias,
-                                   version=version,
-                                   pose_info=pose_info)
-        self.adain = AdaIN2d(out_channels, style_dim)
-
-    def forward(self, x, style_code):
-        x = self.layer(x)
-        return self.adain(x, style_code)
-
 
 class Direction(nn.Module):
     def __init__(self, motion_dim):
         super(Direction, self).__init__()
 
+        #创建一个形状为 (256, motion_dim) 的随机权重参数矩阵
         self.weight = nn.Parameter(torch.randn(256, motion_dim))
 
     def forward(self, input):
         # input: (bs*t) x 256
 
         weight = self.weight + 1e-8
+        #执行QR分解获取正交基向量（通过 torch.qr() ），确保生成的方向向量相互正交
         Q, R = torch.qr(weight)  # get eignvector, orthogonal [n1, n2, n3, n4]
 
         if input is None:
             return Q
         else:
+            #将输入转换为对角矩阵，与正交基矩阵进行矩阵乘法运算，然后求和，生成方向向量
             input_diag = torch.diag_embed(input)  # alpha, diagonal matrix
             out = torch.matmul(input_diag, Q.T)
             out = torch.sum(out, dim=1)
@@ -615,17 +477,17 @@ class Model(nn.Module):
         
 
         self.st_gcnns_encoder_past_motion=nn.ModuleList()
-        #0
+        #0  input_channels = 3
         self.st_gcnns_encoder_past_motion.append(ST_GCNN_layer(input_channels,128,[3,1],1,self.output_len,
                                            joints_to_consider,st_gcnn_dropout,pose_info=pose_info))
         #1
         self.st_gcnns_encoder_past_motion.append(ST_GCNN_layer(128,64,[3,1],1,self.output_len,
                                                joints_to_consider,st_gcnn_dropout, version=1, pose_info=pose_info))
         #2
-        self.st_gcnns_encoder_past_motion.append(ST_GAT_layer(64,128,[3,1],1,self.output_len,
+        self.st_gcnns_encoder_past_motion.append(ST_GCNN_layer(64,128,[3,1],1,self.output_len,
                                                joints_to_consider,st_gcnn_dropout, version=1, pose_info=pose_info))
         #3
-        self.st_gcnns_encoder_past_motion.append(ST_GAT_layer(128,128,[3,1],1,self.output_len,
+        self.st_gcnns_encoder_past_motion.append(ST_GCNN_layer(128,128,[3,1],1,self.output_len,
                                                joints_to_consider,st_gcnn_dropout, pose_info=pose_info))  
         
         self.st_gcnns_compress=nn.ModuleList()
@@ -649,24 +511,25 @@ class Model(nn.Module):
        
         
         self.direction = Direction(motion_dim=self.num_D)
-        self.style_dim = self.direction.weight.shape[0]
         
-        self.decoder_layers = nn.ModuleList()
+        self.st_gcnns_decoder=nn.ModuleList()
 
-        self.decoder_layers.append(StyledDecoderLayer(128,128,[3,1],1,self.output_len,
-                                                joints_to_consider,st_gcnn_dropout, style_dim=self.style_dim, version=1, pose_info=pose_info)) 
-        self.decoder_layers[0].layer.gcn.A = self.st_gcnns_encoder_past_motion[-2].gcn.A
+        #4
+        self.st_gcnns_decoder.append(ST_GCNN_layer(128+256,128,[3,1],1,self.output_len,
+                                               joints_to_consider,st_gcnn_dropout, version=1, pose_info=pose_info)) 
+        self.st_gcnns_decoder[-1].gcn.A = self.st_gcnns_encoder_past_motion[-2].gcn.A
         
-        self.decoder_layers.append(StyledDecoderLayer(128,64,[3,1],1,self.output_len,
-                                                joints_to_consider,st_gcnn_dropout, style_dim=self.style_dim, pose_info=pose_info))   
-        self.decoder_layers[1].layer.gcn.A = self.st_gcnns_encoder_past_motion[-1].gcn.A
-
-        self.decoder_layers.append(StyledDecoderLayer(64,128,[3,1],1,self.output_len,
-                                                joints_to_consider,st_gcnn_dropout, style_dim=self.style_dim, version=1, pose_info=pose_info))
-        self.decoder_layers[2].layer.gcn.A = self.decoder_layers[0].layer.gcn.A
-
-        self.decoder_layers.append(StyledDecoderLayer(128,input_channels,[3,1],1,self.output_len,
-                                                joints_to_consider,st_gcnn_dropout, style_dim=self.style_dim, pose_info=pose_info))
+        #5
+        self.st_gcnns_decoder.append(ST_GCNN_layer(128,64,[3,1],1,self.output_len,
+                                               joints_to_consider,st_gcnn_dropout, pose_info=pose_info))   
+        self.st_gcnns_decoder[-1].gcn.A = self.st_gcnns_encoder_past_motion[-1].gcn.A
+        #6
+        self.st_gcnns_decoder.append(ST_GCNN_layer(64,128,[3,1],1,self.output_len,
+                                               joints_to_consider,st_gcnn_dropout, version=1, pose_info=pose_info))
+        self.st_gcnns_decoder[-1].gcn.A = self.st_gcnns_decoder[-3].gcn.A
+        #7
+        self.st_gcnns_decoder.append(ST_GCNN_layer(128,input_channels,[3,1],1,self.output_len,
+                                               joints_to_consider,st_gcnn_dropout, pose_info=pose_info))
         
 
         self.dct_m, self.idct_m = self.get_dct_matrix(self.t_his + self.t_pred)
@@ -682,7 +545,7 @@ class Model(nn.Module):
         # [bs, c, t_full, v] -> [bs, t_full, c, v]
         x_padding = torch.cat([x_input[:,:,:self.t_his,], y], dim=2).permute(0, 2, 1, 3)
     
-        N, T, C, V = x_padding.shape
+        N, T, C, V = x_padding.shape # [bs, t_full, C, V] = [16, 75, 3, 14]
         
         # [bs, t_full, C, V] -> [bs, t_full, C*V]
     
@@ -690,62 +553,80 @@ class Model(nn.Module):
         
         
         dct_m = self.dct_m.to(x_input.device)
-        idx_pad = list(range(self.t_his)) + [self.t_his - 1] * self.t_pred
+        idx_pad = list(range(self.t_his)) + [self.t_his - 1] * self.t_pred #t_his = 14,0-14
        
-        # [bs, t_full, C*V] -> [bs, t_full, C*V]
+        # [bs, t_full, C*V] -> [bs, t_full, C*V] 
         x_pad = torch.matmul(dct_m[:self.output_len], x_padding[:, idx_pad, :]).reshape([N, -1, C, V]).permute(0, 2, 1, 3)
-        x = x_pad # [N, C, T, V]
+        x = x_pad # [N, C, T, V] =[16,3,20,14] 关节点= 14 ouput_len = 20
         
+        #每次变化的维度只有坐标维度
         for gcn in (self.st_gcnns_encoder_past_motion): #0-3 layer
             x = gcn(x)
-        N, C, T, V = x.shape
+        N, C, T, V = x.shape # [16, 128, 20, 14]
         
         return x
 
-    def decoding(self,z,condition=None,style=None):
+    def decoding(self,z,condition=None):
+        """
+            z：前面encoder和compress的输出特征
+            condition：原始输入x
+        """
         idct_m = self.idct_m.to(z.device)
-        if style is None:
-            raise ValueError('Style code must be provided for decoding with AdaIN.')
    
-        condition = condition.view(condition.shape[0], condition.shape[1], -1, 3).permute(1, 3, 0, 2) #(T_his, bs, Num_Joints, 3) -> [bs, t_full, 3, Num_joints]
+        condition = condition.view(condition.shape[0], condition.shape[1], -1, 3).permute(1, 3, 0, 2) #[16, 3, 75, 14] (T_his, bs, Num_Joints, 3) -> [bs, t_full, 3, Num_joints] 
         y_condition = torch.zeros((condition.shape[0], condition.shape[1], self.t_pred, condition.shape[3])).to(condition.device) 
         condition_padding = torch.cat([condition[:,:,:self.t_his,:], y_condition], dim=2).permute(0, 2, 1, 3)
-        N, T, C, V = condition_padding.shape
+        N, T, C, V = condition_padding.shape #16，75，3，14
         
-        condition_padding = condition_padding.reshape([N, T, C * V])
-        dct_m = self.dct_m.to(condition.device)
-        idx_pad = list(range(self.t_his)) + [self.t_his - 1] * self.t_pred
-        condition_p = torch.matmul(dct_m[:self.output_len], condition_padding[:, idx_pad, :]).reshape([N, -1, C, V]).permute(0, 2, 1, 3)
+        condition_padding = condition_padding.reshape([N, T, C * V]) #[16, 75, 42]
+        dct_m = self.dct_m.to(condition.device) #[75, 75]
+        idx_pad = list(range(self.t_his)) + [self.t_his - 1] * self.t_pred # len(idx_pad) = 75
+        condition_p = torch.matmul(dct_m[:self.output_len], condition_padding[:, idx_pad, :]).reshape([N, -1, C, V]).permute(0, 2, 1, 3)#[800, 3, 20, 14]
         if condition_p.shape[0] != z.shape[0]:
-            condition_p = condition_p.repeat_interleave(self.nk, dim=0)
+            condition_p = condition_p.repeat_interleave(self.nk, dim=0) #这里nk = 50, [N*50, 3, 20, 14]
         
-        for layer in self.decoder_layers:
-            z = layer(z, style)
+        #z初始 = 800, 384, 20, 14, 最终 z = [800, 3, 20, 14]
+        for gcn in (self.st_gcnns_decoder): #0-3 layer
+            z = gcn(z) 
         
-        output = (z + condition_p)
-        N, C, N_fre, V = output.shape 
+        output = (z + condition_p) 
+        N, C, N_fre, V = output.shape #[800, 3, 20, 14]
         
-        output = output.permute(0, 2, 1, 3).reshape([N, -1, C * V])
+        output = output.permute(0, 2, 1, 3).reshape([N, -1, C * V]) #[800, 20, 42]
 
         outputs = torch.matmul(idct_m[:, :self.output_len], output).reshape([N, -1, C, V]).permute(1, 0, 3, 2).contiguous().view(-1,N,C*V)
        
-        return outputs
+        return outputs #[75, 800, 42]
 
     
     def forward(self, x, z=None,epoch=None):
         bs = x.shape[1]
+        #将编码后的Z进行重复，生成多个候选预测（nk表示候选预测的数量）
         z = self.encode_past_motion(x).repeat_interleave(self.nk,dim=0)
+        #构建锚点参数并将其扩展为适合批处理的形状，生成 anchors_input 。这些锚点作为潜在空间中的参考点，用于引导不同的动作预测方向。
         replicated_parameters = torch.cat([self.anchor_input[f'anchor_{i}'].expand(self.nk//self.num_anchor, -1) for i in range(self.num_anchor)], dim=0)
+        #anchor_input 即为原论文的motion query
         anchors_input = replicated_parameters.repeat(bs, 1)
+
+        #将锚点输入与Z进行拼接，形成 z1 ，然后通过多个时空图卷积网络层( st_gcnns_compress )进行处理，这些层用于压缩特征并学习锚点与输入特征之间的关系。
+        # 这里最终anchor_input的形状是(bs*50, 128, self.output_len, self.num_joints)
         z1 = torch.cat((anchors_input.unsqueeze(2).unsqueeze(3).repeat(1, 1, self.output_len, self.num_joints),z),dim=1)
+        
+        #原文中提到的QLP
         for gcn in (self.st_gcnns_compress): #0-3 layer
             z1 = gcn(z1)
+        #生成语义方向
         z1 = z1.mean(-1).mean(-1).view(bs*self.nk,-1)
         alpha = self.down_fc(z1)
+        #再通过 Direction 类转换为语义方向向量( directions )。这些方向向量代表了动作预测中的不同语义属性（如速度、方向等）
         directions = self.direction(alpha)
         
-        feature = z
-        outputs = self.decoding(feature, x, directions)
+        N, C, T, V = z.shape
+        #最终特征构建 ：将语义方向向量与原始Z进行拼接
+        feature = torch.cat((directions.unsqueeze(2).unsqueeze(3).repeat(1, 1, T, V),z),dim=1)
+
+        
+        outputs = self.decoding(feature, x)
        
         return outputs , feature, feature
     
@@ -763,3 +644,6 @@ class Model(nn.Module):
             dct_m = torch.from_numpy(dct_m)
             idct_m = torch.from_numpy(idct_m)
         return dct_m, idct_m  
+
+
+

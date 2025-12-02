@@ -471,11 +471,11 @@ class Model(nn.Module):
             self.t_his = 15
             self.t_pred = 60
         self.nk = 50
-        self.num_anchor = self.nk
-        self.anchor_input = nn.ParameterDict()
-        stdv_anchor = 1. / math.sqrt(128)
-        for i in range(self.num_anchor):
-            self.anchor_input[f'anchor_{i}'] = nn.Parameter(torch.FloatTensor(1, 128).uniform_(-stdv_anchor, stdv_anchor))
+        self.motion_query_mix_ratio = 0.8
+        sigma = self._build_skeleton_correlation_matrix(pose_info)
+        if sigma is None:
+            sigma = torch.empty(0)
+        self.register_buffer('skeleton_sigma', sigma)
         
 
         self.st_gcnns_encoder_past_motion=nn.ModuleList()
@@ -649,14 +649,12 @@ class Model(nn.Module):
         bs = x.shape[1]
         #将编码后的Z进行重复，生成多个候选预测（nk表示候选预测的数量）
         z = self.encode_past_motion(x).repeat_interleave(self.nk,dim=0)
-        #构建锚点参数并将其扩展为适合批处理的形状，生成 anchors_input 。这些锚点作为潜在空间中的参考点，用于引导不同的动作预测方向。
-        replicated_parameters = torch.cat([self.anchor_input[f'anchor_{i}'].expand(self.nk//self.num_anchor, -1) for i in range(self.num_anchor)], dim=0)
-        #anchor_input 即为原论文的motion query
-        anchors_input = replicated_parameters.repeat(bs, 1)
+        #根据骨骼图相关性生成结构化的 motion query
+        anchors_input = self._generate_motion_queries(bs, z.device)
 
         #将锚点输入与Z进行拼接，形成 z1 ，然后通过多个时空图卷积网络层( st_gcnns_compress )进行处理，这些层用于压缩特征并学习锚点与输入特征之间的关系。
         # 这里最终anchor_input的形状是(bs*50, 128, self.output_len, self.num_joints)
-        z1 = torch.cat((anchors_input.unsqueeze(2).unsqueeze(3).repeat(1, 1, self.output_len, self.num_joints),z),dim=1)
+        z1 = torch.cat((anchors_input,z),dim=1)
         
         #原文中提到的QLP
         for gcn in (self.st_gcnns_compress): #0-3 layer
@@ -677,7 +675,63 @@ class Model(nn.Module):
        
         return outputs , feature, feature
     
-   
+    def _build_skeleton_correlation_matrix(self, pose_info):
+        if pose_info is None:
+            return None
+        parents = pose_info.get('parents')
+        keep_joints = pose_info.get('keep_joints')
+        if parents is None:
+            return None
+        if keep_joints is None or len(keep_joints) == 0:
+            keep_joints = list(range(self.original_num_joints))
+        keep_joints = list(map(int, keep_joints))
+        if len(keep_joints) > self.original_num_joints:
+            keep_joints = keep_joints[:self.original_num_joints]
+        joint_map = {joint: idx for idx, joint in enumerate(keep_joints)}
+        num_joints = len(joint_map)
+        if num_joints == 0:
+            return None
+        adjacency = torch.zeros((num_joints, num_joints), dtype=torch.float32)
+        for joint in keep_joints:
+            joint_idx = joint_map[joint]
+            parent = parents[joint]
+            if parent == -1 or parent not in joint_map:
+                continue
+            parent_idx = joint_map[parent]
+            adjacency[joint_idx, parent_idx] = 1.0
+            adjacency[parent_idx, joint_idx] = 1.0
+        adjacency = adjacency + torch.eye(num_joints, dtype=torch.float32)
+        eigenvalues = torch.linalg.eigvalsh(adjacency)
+        lambda_min = torch.min(eigenvalues)
+        lambda_max = torch.max(eigenvalues)
+        denom = (lambda_max - lambda_min).clamp_min(1e-6)
+        sigma = adjacency - lambda_min * torch.eye(num_joints, dtype=torch.float32)
+        sigma = sigma / denom
+        return sigma
+
+    def _sample_structured_noise(self, batch_size, num_joints, channels, sigma_n, device):
+        jitter = 1e-4 * torch.eye(num_joints, device=device)
+        L = torch.linalg.cholesky(sigma_n + jitter)
+        epsilon = torch.randn(batch_size, channels, num_joints, device=device)
+        structured = torch.matmul(epsilon, L.t()).permute(0, 2, 1)
+        pure_noise = torch.randn_like(structured)
+        return self.motion_query_mix_ratio * structured + (1 - self.motion_query_mix_ratio) * pure_noise
+
+    def _generate_motion_queries(self, batch_size, device):
+        total_queries = batch_size * self.nk
+        channels = 128
+        if self.skeleton_sigma.numel() == 0:
+            base_noise = torch.randn(
+                total_queries, channels, self.output_len, self.original_num_joints, device=device
+            )
+        else:
+            sigma = self.skeleton_sigma.to(device)
+            structured = self._sample_structured_noise(
+                total_queries, self.original_num_joints, channels, sigma, device
+            )  # [B, V_orig, C]
+            base_noise = structured.permute(0, 2, 1).unsqueeze(2).repeat(1, 1, self.output_len, 1)
+        return self.get_padding_traj(base_noise)
+
     def get_dct_matrix(self, N, is_torch=True):
         dct_m = np.eye(N, dtype=np.float32)
         for k in np.arange(N):

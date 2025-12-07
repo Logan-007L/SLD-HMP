@@ -535,6 +535,7 @@ class Model(nn.Module):
         self.ny = ny
         self.output_len = 20
         self.num_joints = joints_to_consider
+        self.anchor_feature_dim = 128
         self.num_D = 30
         if nx == 48:
             self.t_his = 25
@@ -543,11 +544,23 @@ class Model(nn.Module):
             self.t_his = 15
             self.t_pred = 60
         self.nk = 50
-        self.motion_query_mix_ratio = 0.8
         sigma = self._build_skeleton_correlation_matrix(pose_info)
         if sigma is None:
             sigma = torch.empty(0)
         self.register_buffer("skeleton_sigma", sigma)
+        if sigma.numel() == 0:
+            cholesky = torch.empty(0)
+        else:
+            jitter = 1e-4 * torch.eye(sigma.shape[0], dtype=sigma.dtype)
+            cholesky = torch.linalg.cholesky(sigma + jitter)
+        self.register_buffer("skeleton_cholesky", cholesky)
+
+        self.anchor_means = nn.Parameter(torch.zeros(self.nk, self.anchor_feature_dim))
+        nn.init.normal_(self.anchor_means, mean=0.0, std=0.02)
+        self.structure_proj = nn.Linear(self.num_joints, self.anchor_feature_dim)
+        nn.init.xavier_uniform_(self.structure_proj.weight, gain=1e-2)
+        nn.init.zeros_(self.structure_proj.bias)
+        self.noise_weight = nn.Parameter(torch.tensor(0.1))
 
         self.st_gcnns_encoder_past_motion = nn.ModuleList()
         self.st_gcnns_encoder_past_motion.append(
@@ -828,32 +841,28 @@ class Model(nn.Module):
         sigma = sigma / denom
         return sigma
 
-    def _sample_structured_noise(self, batch_size, num_joints, channels, sigma_n, device):
-        jitter = 1e-4 * torch.eye(num_joints, device=device)
-        L = torch.linalg.cholesky(sigma_n.to(device) + jitter)
-        epsilon = torch.randn(batch_size, channels, num_joints, device=device)
-        structured = torch.matmul(epsilon, L.t())
-        pure_noise = torch.randn_like(structured)
-        return self.motion_query_mix_ratio * structured + (1 - self.motion_query_mix_ratio) * pure_noise
+    def _sample_structured_noise(self, total_queries, device):
+        if self.skeleton_cholesky.numel() == 0:
+            joint_noise = torch.randn(total_queries, self.num_joints, device=device)
+        else:
+            L = self.skeleton_cholesky.to(device)
+            epsilon = torch.randn(total_queries, self.num_joints, device=device)
+            joint_noise = torch.matmul(epsilon, L.t())
+        mapped_noise = self.structure_proj(joint_noise)
+        return mapped_noise
 
     def _generate_motion_queries(self, batch_size, device):
         total_queries = batch_size * self.nk
-        channels = 128
-        if self.skeleton_sigma.numel() == 0:
-            base_noise = torch.randn(
-                total_queries,
-                channels,
-                self.output_len,
-                self.num_joints,
-                device=device,
-            )
-        else:
-            sigma = self.skeleton_sigma.to(device)
-            structured = self._sample_structured_noise(
-                total_queries, self.num_joints, channels, sigma, device
-            )
-            base_noise = structured.unsqueeze(2).repeat(1, 1, self.output_len, 1)
-        return base_noise
+        anchors_mean = (
+            self.anchor_means.unsqueeze(0)
+            .expand(batch_size, -1, -1)
+            .reshape(total_queries, self.anchor_feature_dim)
+        )
+        anchors_mean = anchors_mean.to(device)
+        structured_noise = self._sample_structured_noise(total_queries, device)
+        anchors = anchors_mean + self.noise_weight * structured_noise
+        anchors = anchors.unsqueeze(2).unsqueeze(3).repeat(1, 1, self.output_len, self.num_joints)
+        return anchors
 
     def get_dct_matrix(self, N, is_torch=True):
         dct_m = np.eye(N, dtype=np.float32)

@@ -473,10 +473,23 @@ class ST_GAT_layer(nn.Module):
                  num_heads=4):
 
         super().__init__()
+        if isinstance(kernel_size, int):
+            kernel_size = (kernel_size, kernel_size)
+        elif len(kernel_size) != 2:
+            raise ValueError("kernel_size must be int or length-2 iterable")
+        else:
+            kernel_size = tuple(kernel_size)
+
+        if isinstance(stride, int):
+            stride = (stride, stride)
+        elif len(stride) != 2:
+            raise ValueError("stride must be int or length-2 iterable")
+        else:
+            stride = tuple(stride)
+
         self.kernel_size = kernel_size
-        assert self.kernel_size[0] % 2 == 1
-        assert self.kernel_size[1] % 2 == 1
-        padding = ((self.kernel_size[0] - 1) // 2,(self.kernel_size[1] - 1) // 2)
+        self.stride = stride
+        padding = tuple((k - 1) // 2 for k in self.kernel_size)
 
         if version == 0:
             self.gcn = ConvTemporalGraphical(time_dim, joints_dim)
@@ -491,8 +504,8 @@ class ST_GAT_layer(nn.Module):
             nn.Conv2d(
                 in_channels,
                 out_channels,
-                (self.kernel_size[0], self.kernel_size[1]),
-                (stride, stride),
+                self.kernel_size,
+                self.stride,
                 padding,
                 bias=bias,
             ),
@@ -500,9 +513,9 @@ class ST_GAT_layer(nn.Module):
             nn.Dropout(dropout, inplace=True),
         )
 
-        if stride != 1 or in_channels != out_channels:
+        if self.stride != (1, 1) or in_channels != out_channels:
             self.residual = nn.Sequential(
-                nn.Conv2d(in_channels, out_channels, kernel_size=1, stride=(1, 1), bias=bias),
+                nn.Conv2d(in_channels, out_channels, kernel_size=1, stride=self.stride, bias=bias),
                 nn.BatchNorm2d(out_channels),
             )
         else:
@@ -608,13 +621,13 @@ class Model(nn.Module):
         
         self.st_gcnns_compress=nn.ModuleList()
         #0
-        self.st_gcnns_compress.append(ST_GCNN_layer_down(256,512,[2,2],2,self.output_len,
+        self.st_gcnns_compress.append(ST_GAT_layer(256,512,[2,2],2,self.output_len,
                                                joints_to_consider,st_gcnn_dropout,  pose_info=pose_info))
         #2
-        self.st_gcnns_compress.append(ST_GCNN_layer_down(512,768,[2,2],2,self.output_len//2,
+        self.st_gcnns_compress.append(ST_GAT_layer(512,768,[2,2],2,self.output_len//2,
                                                joints_to_consider//2,st_gcnn_dropout, pose_info=pose_info))
 
-        self.st_gcnns_compress.append(ST_GCNN_layer_down(768,1024,[2,2],2,self.output_len//4,
+        self.st_gcnns_compress.append(ST_GAT_layer(768,1024,[2,2],2,self.output_len//4,
                                                joints_to_consider//4,st_gcnn_dropout, pose_info=pose_info))
        
        

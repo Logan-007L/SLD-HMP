@@ -207,10 +207,13 @@ def train(epoch, stats):
     train_losses /= total_num_sample
     losses_str = ' '.join(['{}: {:.4f}'.format(x, y) for x, y in zip(loss_names, train_losses)])
     lr = optimizer.param_groups[0]['lr']
-    # average cost of log time 20s
+    # 监控结构噪声权重，便于观察其收敛情况
+    noise_weight_value = model.noise_weight.detach().item()
     tb_logger.add_scalar('train_grad', train_grad / total_num_sample, epoch)
+    tb_logger.add_scalar('noise_weight', noise_weight_value, epoch)
     
-    logger.info('====> Epoch: {} Time: {:.2f} {}  lr: {:.5f} branch_stats: {}'.format(epoch, time.time() - t_s, losses_str , lr, stats))
+    logger.info('====> Epoch: {} Time: {:.2f} {}  lr: {:.5f} noise_weight: {:.6f} branch_stats: {}'.format(
+        epoch, time.time() - t_s, losses_str , lr, noise_weight_value, stats))
     
     return stats
 

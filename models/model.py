@@ -569,10 +569,13 @@ class ST_GAT_Compress_layer(nn.Module):
         )
 
         if self.stride != (1, 1) or in_channels != out_channels:
-            self.residual = nn.Sequential(
-                nn.Conv2d(in_channels, out_channels, kernel_size=1, stride=self.stride, bias=bias),
+            residual_layers = [
+                nn.Conv2d(in_channels, out_channels, kernel_size=1, stride=(1, 1), bias=bias),
                 nn.BatchNorm2d(out_channels),
-            )
+            ]
+            if self.stride != (1, 1):
+                residual_layers.append(nn.AvgPool2d(kernel_size=self.stride, stride=self.stride))
+            self.residual = nn.Sequential(*residual_layers)
         else:
             self.residual = nn.Identity()
 

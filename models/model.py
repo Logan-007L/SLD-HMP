@@ -562,6 +562,8 @@ class Model(nn.Module):
             self.t_pred = 60
         self.nk = 50
         self.num_anchor = self.nk
+        self.anchor_feature_dim = 128
+        self.feature_dim = self.anchor_feature_dim
         # self.anchor_input = nn.ParameterDict()
         # stdv_anchor = 1. / math.sqrt(128)
         # for i in range(self.num_anchor):
@@ -576,14 +578,18 @@ class Model(nn.Module):
         else:
             jitter = 1e-4 * torch.eye(sigma.shape[0], dtype=sigma.dtype)
             cholesky = torch.linalg.cholesky(sigma + jitter)
-        self.register_buffer("skeleton_cholesky", cholesky)
+        self.register_buffer("L_cholesky", cholesky)
 
         self.anchor_means = nn.Parameter(torch.zeros(self.nk, self.anchor_feature_dim))
         nn.init.normal_(self.anchor_means, mean=0.0, std=0.02)
-        self.structure_proj = nn.Linear(self.num_joints, self.anchor_feature_dim)
-        nn.init.xavier_uniform_(self.structure_proj.weight, gain=1e-2)
-        nn.init.zeros_(self.structure_proj.bias)
-        self.noise_weight = nn.Parameter(torch.tensor(0.1))
+        self.structure_proj = nn.Sequential(
+            nn.Linear(self.num_joints, 64),
+            nn.ReLU(),
+            nn.Linear(64, self.anchor_feature_dim),
+        )
+        nn.init.xavier_uniform_(self.structure_proj[2].weight, gain=1e-2)
+        nn.init.zeros_(self.structure_proj[2].bias)
+        self.noise_weight = nn.Parameter(torch.tensor(0.001))
 
 
         self.st_gcnns_encoder_past_motion=nn.ModuleList()
@@ -742,34 +748,31 @@ class Model(nn.Module):
             return sigma
 
     def _sample_structured_noise(self, total_queries, device):
-        if self.skeleton_cholesky.numel() == 0:
+        if self.L_cholesky.numel() == 0:
             joint_noise = torch.randn(total_queries, self.num_joints, device=device)
         else:
-            L = self.skeleton_cholesky.to(device)
             epsilon = torch.randn(total_queries, self.num_joints, device=device)
+            L = self.L_cholesky.to(device)
             joint_noise = torch.matmul(epsilon, L.t())
         mapped_noise = self.structure_proj(joint_noise)
         return mapped_noise
 
-    def _generate_motion_queries(self, batch_size, device):
-        total_queries = batch_size * self.nk
-        anchors_mean = (
-            self.anchor_means.unsqueeze(0)
-            .expand(batch_size, -1, -1)
-            .reshape(total_queries, self.anchor_feature_dim)
-        )
-        anchors_mean = anchors_mean.to(device)
-        structured_noise = self._sample_structured_noise(total_queries, device)
-        anchors = anchors_mean + self.noise_weight * structured_noise
-        anchors = anchors.unsqueeze(2).unsqueeze(3).repeat(1, 1, self.output_len, self.num_joints)
-        return anchors
-    
     def forward(self, x, z=None,epoch=None):
         bs = x.shape[1]
         #将编码后的Z进行重复，生成多个候选预测（nk表示候选预测的数量）
         z = self.encode_past_motion(x).repeat_interleave(self.nk,dim=0)
-        #构建锚点参数并将其扩展为适合批处理的形状，生成 anchors_input 。这些锚点作为潜在空间中的参考点，用于引导不同的动作预测方向。
-        anchors_input = self._generate_motion_queries(bs, z.device)
+        #构建锚点均值并复制到批次维度
+        total_queries = bs * self.nk
+        anchors_mean = (
+            self.anchor_means.unsqueeze(0)
+            .expand(bs, -1, -1)
+            .reshape(total_queries, self.anchor_feature_dim)
+            .to(z.device)
+        )
+        #采样结构化噪声并通过结构投影映射到特征空间
+        structured_noise = self._sample_structured_noise(total_queries, z.device)
+        anchors_input = anchors_mean + self.noise_weight * structured_noise
+        anchors_input = anchors_input.unsqueeze(2).unsqueeze(3).repeat(1, 1, self.output_len, self.num_joints)
         z1 = torch.cat((anchors_input, z), dim=1)
 
         #原文中提到的QLP

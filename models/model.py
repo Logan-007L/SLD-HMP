@@ -519,6 +519,38 @@ class ST_GAT_layer(nn.Module):
         return self.prelu(x_out + res)
 
 
+class ST_GAT_decoder_layer(ST_GAT_layer):
+    """
+    Decoder专用的ST-GAT层，保持与原ST_GCNN decoder一致的接口，
+    方便复用编码阶段学习到的图结构参数。
+    """
+    def __init__(self,
+                 in_channels,
+                 out_channels,
+                 kernel_size,
+                 stride,
+                 time_dim,
+                 joints_dim,
+                 dropout,
+                 bias=True,
+                 version=0,
+                 pose_info=None,
+                 num_heads=4):
+        super().__init__(
+            in_channels=in_channels,
+            out_channels=out_channels,
+            kernel_size=kernel_size,
+            stride=stride,
+            time_dim=time_dim,
+            joints_dim=joints_dim,
+            dropout=dropout,
+            bias=bias,
+            version=version,
+            pose_info=pose_info,
+            num_heads=num_heads,
+        )
+
+
 class ST_GAT_Compress_layer(nn.Module):
     def __init__(self,
                  in_channels,
@@ -702,20 +734,20 @@ class Model(nn.Module):
         self.st_gcnns_decoder=nn.ModuleList()
 
         #4
-        self.st_gcnns_decoder.append(ST_GCNN_layer(128+256,128,[3,1],1,self.output_len,
+        self.st_gcnns_decoder.append(ST_GAT_decoder_layer(128+256,128,[3,1],1,self.output_len,
                                                joints_to_consider,st_gcnn_dropout, version=1, pose_info=pose_info)) 
         self.st_gcnns_decoder[-1].gcn.A = self.st_gcnns_encoder_past_motion[-2].gcn.A
         
         #5
-        self.st_gcnns_decoder.append(ST_GCNN_layer(128,64,[3,1],1,self.output_len,
+        self.st_gcnns_decoder.append(ST_GAT_decoder_layer(128,64,[3,1],1,self.output_len,
                                                joints_to_consider,st_gcnn_dropout, pose_info=pose_info))   
         self.st_gcnns_decoder[-1].gcn.A = self.st_gcnns_encoder_past_motion[-1].gcn.A
         #6
-        self.st_gcnns_decoder.append(ST_GCNN_layer(64,128,[3,1],1,self.output_len,
+        self.st_gcnns_decoder.append(ST_GAT_decoder_layer(64,128,[3,1],1,self.output_len,
                                                joints_to_consider,st_gcnn_dropout, version=1, pose_info=pose_info))
         self.st_gcnns_decoder[-1].gcn.A = self.st_gcnns_decoder[-3].gcn.A
         #7
-        self.st_gcnns_decoder.append(ST_GCNN_layer(128,input_channels,[3,1],1,self.output_len,
+        self.st_gcnns_decoder.append(ST_GAT_decoder_layer(128,input_channels,[3,1],1,self.output_len,
                                                joints_to_consider,st_gcnn_dropout, pose_info=pose_info))
         
 

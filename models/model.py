@@ -428,6 +428,106 @@ class ST_GCNN_layer(nn.Module):
         return x
 
 
+class SpatioTemporalAttentionLayer(nn.Module):
+    """
+    利用时序注意力与空间注意力串联来建模 joints 与 frames 的依赖关系，
+    输入输出张量格式与 ST_GCNN_layer 保持一致: [N, C, T, V]。
+    """
+
+    def __init__(self,
+                 in_channels,
+                 out_channels,
+                 kernel_size,
+                 stride,
+                 time_dim,
+                 joints_dim,
+                 dropout,
+                 num_heads=4,
+                 bias=True,
+                 version=0,
+                 pose_info=None):
+        super(SpatioTemporalAttentionLayer, self).__init__()
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.time_dim = time_dim
+        self.joints_dim = joints_dim
+        if isinstance(stride, (list, tuple)):
+            self.stride = (stride[0], stride[1])
+        else:
+            self.stride = (stride, stride)
+
+        if min(self.stride) < 1:
+            raise ValueError("stride 必须 >= 1")
+
+        self.temporal_q = nn.Linear(in_channels, out_channels, bias=bias)
+        self.temporal_k = nn.Linear(in_channels, out_channels, bias=bias)
+        self.temporal_v = nn.Linear(in_channels, out_channels, bias=bias)
+        self.temporal_attn = nn.MultiheadAttention(out_channels, num_heads, dropout=dropout, batch_first=True)
+        self.temporal_norm = nn.LayerNorm(out_channels)
+
+        self.spatial_q = nn.Linear(out_channels, out_channels, bias=bias)
+        self.spatial_k = nn.Linear(out_channels, out_channels, bias=bias)
+        self.spatial_v = nn.Linear(out_channels, out_channels, bias=bias)
+        self.spatial_attn = nn.MultiheadAttention(out_channels, num_heads, dropout=dropout, batch_first=True)
+        self.spatial_norm = nn.LayerNorm(out_channels)
+
+        self.mlp = nn.Sequential(
+            nn.Conv2d(out_channels, out_channels, kernel_size=1),
+            nn.BatchNorm2d(out_channels),
+            nn.Dropout(dropout, inplace=True),
+        )
+
+        if in_channels != out_channels:
+            self.residual = nn.Sequential(
+                nn.Conv2d(in_channels, out_channels, kernel_size=1),
+                nn.BatchNorm2d(out_channels),
+            )
+        else:
+            self.residual = nn.Identity()
+
+        if self.stride != (1, 1):
+            self.downsample = nn.AvgPool2d(self.stride)
+        else:
+            self.downsample = None
+
+        self.prelu = nn.PReLU()
+
+    def forward(self, x):
+        res = self.residual(x)
+
+        x = self._temporal_attention(x)
+        x = self._spatial_attention(x)
+        x = self.mlp(x)
+
+        if self.downsample is not None:
+            x = self.downsample(x)
+            res = self.downsample(res)
+
+        x = x + res
+        return self.prelu(x)
+
+    def _temporal_attention(self, x):
+        n, c, t, v = x.shape
+        seq = x.permute(0, 3, 2, 1).contiguous().view(n * v, t, c)
+        q = self.temporal_q(seq)
+        k = self.temporal_k(seq)
+        val = self.temporal_v(seq)
+        attn_out, _ = self.temporal_attn(q, k, val)
+        attn_out = self.temporal_norm(attn_out)
+        attn_out = attn_out.view(n, v, t, self.out_channels).permute(0, 3, 2, 1).contiguous()
+        return attn_out
+
+    def _spatial_attention(self, x):
+        n, c, t, v = x.shape
+        seq = x.permute(0, 2, 3, 1).contiguous().view(n * t, v, c)
+        q = self.spatial_q(seq)
+        k = self.spatial_k(seq)
+        val = self.spatial_v(seq)
+        attn_out, _ = self.spatial_attn(q, k, val)
+        attn_out = self.spatial_norm(attn_out)
+        attn_out = attn_out.view(n, t, v, self.out_channels).permute(0, 3, 1, 2).contiguous()
+        return attn_out
+
 
 class Direction(nn.Module):
     def __init__(self, motion_dim):

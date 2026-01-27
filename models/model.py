@@ -383,8 +383,6 @@ class ST_GCNN_layer(nn.Module):
         elif version == 1:
             self.gcn = ConvTemporalGraphicalV1(time_dim,joints_dim,pose_info=pose_info)
 
-
-        
         self.tcn = nn.Sequential(
             nn.Conv2d(
                 in_channels,
@@ -426,14 +424,41 @@ class ST_GCNN_layer(nn.Module):
         x=x+res
         x=self.prelu(x)
         return x
+class SpatialGraphAttention(nn.Module):
+    def __init__(self, channels, num_heads=4, attn_dropout=0.1):
+        super().__init__()
+        num_heads = max(1, min(num_heads, channels))
+        if channels % num_heads != 0:
+            for candidate in range(num_heads, 0, -1):
+                if channels % candidate == 0:
+                    num_heads = candidate
+                    break
+        self.num_heads = num_heads
+        self.head_dim = channels // self.num_heads
+        self.scale = self.head_dim ** -0.5
+        self.q_proj = nn.Conv2d(channels, channels, kernel_size=1)
+        self.k_proj = nn.Conv2d(channels, channels, kernel_size=1)
+        self.v_proj = nn.Conv2d(channels, channels, kernel_size=1)
+        self.out_proj = nn.Conv2d(channels, channels, kernel_size=1)
+        self.attn_drop = nn.Dropout(attn_dropout)
+        self.proj_drop = nn.Dropout(attn_dropout)
 
+    def forward(self, x):
+        N, C, T, V = x.shape
+        q = self.q_proj(x).view(N, self.num_heads, self.head_dim, T, V).permute(0, 1, 3, 4, 2)
+        k = self.k_proj(x).view(N, self.num_heads, self.head_dim, T, V).permute(0, 1, 3, 4, 2)
+        v = self.v_proj(x).view(N, self.num_heads, self.head_dim, T, V).permute(0, 1, 3, 4, 2)
 
-class SpatioTemporalAttentionLayer(nn.Module):
-    """
-    利用时序注意力与空间注意力串联来建模 joints 与 frames 的依赖关系，
-    输入输出张量格式与 ST_GCNN_layer 保持一致: [N, C, T, V]。
-    """
+        attn = torch.einsum('nhtvd,nhtwd->nhtvw', q, k) * self.scale
+        attn = torch.softmax(attn, dim=-1)
+        attn = self.attn_drop(attn)
 
+        out = torch.einsum('nhtvw,nhtwd->nhtvd', attn, v)
+        out = out.permute(0, 1, 4, 2, 3).contiguous().view(N, -1, T, V)
+        out = self.out_proj(out)
+        return self.proj_drop(out)
+
+class ST_GAT_layer(nn.Module):
     def __init__(self,
                  in_channels,
                  out_channels,
@@ -442,91 +467,56 @@ class SpatioTemporalAttentionLayer(nn.Module):
                  time_dim,
                  joints_dim,
                  dropout,
-                 num_heads=4,
                  bias=True,
                  version=0,
-                 pose_info=None):
-        super(SpatioTemporalAttentionLayer, self).__init__()
-        self.in_channels = in_channels
-        self.out_channels = out_channels
-        self.time_dim = time_dim
-        self.joints_dim = joints_dim
-        if isinstance(stride, (list, tuple)):
-            self.stride = (stride[0], stride[1])
+                 pose_info=None,
+                 num_heads=4):
+
+        super().__init__()
+        self.kernel_size = kernel_size
+        assert self.kernel_size[0] % 2 == 1
+        assert self.kernel_size[1] % 2 == 1
+        padding = ((self.kernel_size[0] - 1) // 2,(self.kernel_size[1] - 1) // 2)
+
+        if version == 0:
+            self.gcn = ConvTemporalGraphical(time_dim, joints_dim)
+        elif version == 1:
+            self.gcn = ConvTemporalGraphicalV1(time_dim, joints_dim, pose_info=pose_info)
         else:
-            self.stride = (stride, stride)
+            raise ValueError(f'Unsupported version {version} for ST_GAT_layer')
 
-        if min(self.stride) < 1:
-            raise ValueError("stride 必须 >= 1")
+        self.spatial_attention = SpatialGraphAttention(in_channels, num_heads=num_heads, attn_dropout=dropout)
 
-        self.temporal_q = nn.Linear(in_channels, out_channels, bias=bias)
-        self.temporal_k = nn.Linear(in_channels, out_channels, bias=bias)
-        self.temporal_v = nn.Linear(in_channels, out_channels, bias=bias)
-        self.temporal_attn = nn.MultiheadAttention(out_channels, num_heads, dropout=dropout, batch_first=True)
-        self.temporal_norm = nn.LayerNorm(out_channels)
-
-        self.spatial_q = nn.Linear(out_channels, out_channels, bias=bias)
-        self.spatial_k = nn.Linear(out_channels, out_channels, bias=bias)
-        self.spatial_v = nn.Linear(out_channels, out_channels, bias=bias)
-        self.spatial_attn = nn.MultiheadAttention(out_channels, num_heads, dropout=dropout, batch_first=True)
-        self.spatial_norm = nn.LayerNorm(out_channels)
-
-        self.mlp = nn.Sequential(
-            nn.Conv2d(out_channels, out_channels, kernel_size=1),
+        self.tcn = nn.Sequential(
+            nn.Conv2d(
+                in_channels,
+                out_channels,
+                (self.kernel_size[0], self.kernel_size[1]),
+                (stride, stride),
+                padding,
+                bias=bias,
+            ),
             nn.BatchNorm2d(out_channels),
             nn.Dropout(dropout, inplace=True),
         )
 
-        if in_channels != out_channels:
+        if stride != 1 or in_channels != out_channels:
             self.residual = nn.Sequential(
-                nn.Conv2d(in_channels, out_channels, kernel_size=1),
+                nn.Conv2d(in_channels, out_channels, kernel_size=1, stride=(1, 1), bias=bias),
                 nn.BatchNorm2d(out_channels),
             )
         else:
             self.residual = nn.Identity()
 
-        if self.stride != (1, 1):
-            self.downsample = nn.AvgPool2d(self.stride)
-        else:
-            self.downsample = None
-
         self.prelu = nn.PReLU()
 
     def forward(self, x):
         res = self.residual(x)
-
-        x = self._temporal_attention(x)
-        x = self._spatial_attention(x)
-        x = self.mlp(x)
-
-        if self.downsample is not None:
-            x = self.downsample(x)
-            res = self.downsample(res)
-
-        x = x + res
-        return self.prelu(x)
-
-    def _temporal_attention(self, x):
-        n, c, t, v = x.shape
-        seq = x.permute(0, 3, 2, 1).contiguous().view(n * v, t, c)
-        q = self.temporal_q(seq)
-        k = self.temporal_k(seq)
-        val = self.temporal_v(seq)
-        attn_out, _ = self.temporal_attn(q, k, val)
-        attn_out = self.temporal_norm(attn_out)
-        attn_out = attn_out.view(n, v, t, self.out_channels).permute(0, 3, 2, 1).contiguous()
-        return attn_out
-
-    def _spatial_attention(self, x):
-        n, c, t, v = x.shape
-        seq = x.permute(0, 2, 3, 1).contiguous().view(n * t, v, c)
-        q = self.spatial_q(seq)
-        k = self.spatial_k(seq)
-        val = self.spatial_v(seq)
-        attn_out, _ = self.spatial_attn(q, k, val)
-        attn_out = self.spatial_norm(attn_out)
-        attn_out = attn_out.view(n, t, v, self.out_channels).permute(0, 3, 1, 2).contiguous()
-        return attn_out
+        x_physical = self.gcn(x)
+        x_semantic = self.spatial_attention(x)
+        x_fused = x_physical + x_semantic
+        x_out = self.tcn(x_fused)
+        return self.prelu(x_out + res)
 
 
 class Direction(nn.Module):
@@ -579,17 +569,17 @@ class Model(nn.Module):
         
 
         self.st_gcnns_encoder_past_motion=nn.ModuleList()
-        #0
+        #0  input_channels = 3
         self.st_gcnns_encoder_past_motion.append(ST_GCNN_layer(input_channels,128,[3,1],1,self.output_len,
                                            joints_to_consider,st_gcnn_dropout,pose_info=pose_info))
         #1
         self.st_gcnns_encoder_past_motion.append(ST_GCNN_layer(128,64,[3,1],1,self.output_len,
                                                joints_to_consider,st_gcnn_dropout, version=1, pose_info=pose_info))
         #2
-        self.st_gcnns_encoder_past_motion.append(ST_GCNN_layer(64,128,[3,1],1,self.output_len,
+        self.st_gcnns_encoder_past_motion.append(ST_GAT_layer(64,128,[3,1],1,self.output_len,
                                                joints_to_consider,st_gcnn_dropout, version=1, pose_info=pose_info))
         #3
-        self.st_gcnns_encoder_past_motion.append(ST_GCNN_layer(128,128,[3,1],1,self.output_len,
+        self.st_gcnns_encoder_past_motion.append(ST_GAT_layer(128,128,[3,1],1,self.output_len,
                                                joints_to_consider,st_gcnn_dropout, pose_info=pose_info))  
         
         self.st_gcnns_compress=nn.ModuleList()
@@ -647,7 +637,7 @@ class Model(nn.Module):
         # [bs, c, t_full, v] -> [bs, t_full, c, v]
         x_padding = torch.cat([x_input[:,:,:self.t_his,], y], dim=2).permute(0, 2, 1, 3)
     
-        N, T, C, V = x_padding.shape
+        N, T, C, V = x_padding.shape # [bs, t_full, C, V] = [16, 75, 3, 14]
         
         # [bs, t_full, C, V] -> [bs, t_full, C*V]
     
@@ -655,44 +645,50 @@ class Model(nn.Module):
         
         
         dct_m = self.dct_m.to(x_input.device)
-        idx_pad = list(range(self.t_his)) + [self.t_his - 1] * self.t_pred
+        idx_pad = list(range(self.t_his)) + [self.t_his - 1] * self.t_pred #t_his = 14,0-14
        
-        # [bs, t_full, C*V] -> [bs, t_full, C*V]
+        # [bs, t_full, C*V] -> [bs, t_full, C*V] 
         x_pad = torch.matmul(dct_m[:self.output_len], x_padding[:, idx_pad, :]).reshape([N, -1, C, V]).permute(0, 2, 1, 3)
-        x = x_pad # [N, C, T, V]
+        x = x_pad # [N, C, T, V] =[16,3,20,14] 关节点= 14 ouput_len = 20
         
+        #每次变化的维度只有坐标维度
         for gcn in (self.st_gcnns_encoder_past_motion): #0-3 layer
             x = gcn(x)
-        N, C, T, V = x.shape
+        N, C, T, V = x.shape # [16, 128, 20, 14]
         
         return x
 
     def decoding(self,z,condition=None):
+        """
+            z：前面encoder和compress的输出特征
+            condition：原始输入x
+        """
         idct_m = self.idct_m.to(z.device)
    
-        condition = condition.view(condition.shape[0], condition.shape[1], -1, 3).permute(1, 3, 0, 2) #(T_his, bs, Num_Joints, 3) -> [bs, t_full, 3, Num_joints]
+        condition = condition.view(condition.shape[0], condition.shape[1], -1, 3).permute(1, 3, 0, 2) #[16, 3, 75, 14] (T_his, bs, Num_Joints, 3) -> [bs, t_full, 3, Num_joints] 
         y_condition = torch.zeros((condition.shape[0], condition.shape[1], self.t_pred, condition.shape[3])).to(condition.device) 
         condition_padding = torch.cat([condition[:,:,:self.t_his,:], y_condition], dim=2).permute(0, 2, 1, 3)
-        N, T, C, V = condition_padding.shape
+        N, T, C, V = condition_padding.shape #16，75，3，14
         
-        condition_padding = condition_padding.reshape([N, T, C * V])
-        dct_m = self.dct_m.to(condition.device)
-        idx_pad = list(range(self.t_his)) + [self.t_his - 1] * self.t_pred
-        condition_p = torch.matmul(dct_m[:self.output_len], condition_padding[:, idx_pad, :]).reshape([N, -1, C, V]).permute(0, 2, 1, 3)
+        condition_padding = condition_padding.reshape([N, T, C * V]) #[16, 75, 42]
+        dct_m = self.dct_m.to(condition.device) #[75, 75]
+        idx_pad = list(range(self.t_his)) + [self.t_his - 1] * self.t_pred # len(idx_pad) = 75
+        condition_p = torch.matmul(dct_m[:self.output_len], condition_padding[:, idx_pad, :]).reshape([N, -1, C, V]).permute(0, 2, 1, 3)#[800, 3, 20, 14]
         if condition_p.shape[0] != z.shape[0]:
-            condition_p = condition_p.repeat_interleave(self.nk, dim=0)
+            condition_p = condition_p.repeat_interleave(self.nk, dim=0) #这里nk = 50, [N*50, 3, 20, 14]
         
+        #z初始 = 800, 384, 20, 14, 最终 z = [800, 3, 20, 14]
         for gcn in (self.st_gcnns_decoder): #0-3 layer
-            z = gcn(z)
+            z = gcn(z) 
         
-        output = (z + condition_p)
-        N, C, N_fre, V = output.shape 
+        output = (z + condition_p) 
+        N, C, N_fre, V = output.shape #[800, 3, 20, 14]
         
-        output = output.permute(0, 2, 1, 3).reshape([N, -1, C * V])
+        output = output.permute(0, 2, 1, 3).reshape([N, -1, C * V]) #[800, 20, 42]
 
         outputs = torch.matmul(idct_m[:, :self.output_len], output).reshape([N, -1, C, V]).permute(1, 0, 3, 2).contiguous().view(-1,N,C*V)
        
-        return outputs
+        return outputs #[75, 800, 42]
 
     
     def forward(self, x, z=None,epoch=None):

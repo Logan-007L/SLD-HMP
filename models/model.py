@@ -544,6 +544,33 @@ class Direction(nn.Module):
             return out
 
 
+class ContextualDirectionProjection(nn.Module):
+    def __init__(self, direction_dim, context_dim, attn_dim=None, dropout=0.0):
+        super().__init__()
+        if attn_dim is None:
+            attn_dim = direction_dim
+        self.q_proj = nn.Linear(direction_dim, attn_dim, bias=False)
+        self.k_proj = nn.Linear(context_dim, attn_dim, bias=False)
+        self.v_proj = nn.Linear(context_dim, attn_dim, bias=False)
+        self.scale = attn_dim ** -0.5
+        self.attn_drop = nn.Dropout(dropout)
+        self.gate_proj = nn.Linear(attn_dim, direction_dim)
+
+    def forward(self, directions, context):
+        # directions: [N, D], context: [N, C, T, V]
+        n, c, t, v = context.shape
+        context_tokens = context.permute(0, 2, 3, 1).reshape(n, t * v, c)
+        q = self.q_proj(directions).unsqueeze(1)  # [N, 1, A]
+        k = self.k_proj(context_tokens)  # [N, L, A]
+        v = self.v_proj(context_tokens)  # [N, L, A]
+        attn = torch.bmm(q, k.transpose(1, 2)) * self.scale
+        attn = torch.softmax(attn, dim=-1)
+        attn = self.attn_drop(attn)
+        context_vec = torch.bmm(attn, v).squeeze(1)  # [N, A]
+        gate = torch.tanh(self.gate_proj(context_vec))
+        return directions * (1.0 + gate)
+
+
 class Model(nn.Module):
     def __init__(self, nx, ny,input_channels,st_gcnn_dropout,
                  joints_to_consider,
@@ -603,6 +630,15 @@ class Model(nn.Module):
        
         
         self.direction = Direction(motion_dim=self.num_D)
+        direction_dim = self.direction.weight.shape[0]
+        context_dim = self.st_gcnns_encoder_past_motion[-1].tcn[0].out_channels
+        attn_dim = min(direction_dim, context_dim)
+        self.context_projection = ContextualDirectionProjection(
+            direction_dim=direction_dim,
+            context_dim=context_dim,
+            attn_dim=attn_dim,
+            dropout=st_gcnn_dropout,
+        )
         
         self.st_gcnns_decoder=nn.ModuleList()
 
@@ -715,6 +751,7 @@ class Model(nn.Module):
         
         N, C, T, V = z.shape
         #最终特征构建 ：将语义方向向量与原始Z进行拼接
+        directions = self.context_projection(directions, z)
         feature = torch.cat((directions.unsqueeze(2).unsqueeze(3).repeat(1, 1, T, V),z),dim=1)
 
         

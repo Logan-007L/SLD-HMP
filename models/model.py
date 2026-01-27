@@ -568,7 +568,9 @@ class ContextualDirectionProjection(nn.Module):
         attn = self.attn_drop(attn)
         context_vec = torch.bmm(attn, v).squeeze(1)  # [N, A]
         gate = torch.tanh(self.gate_proj(context_vec))
-        return directions * (1.0 + gate)
+        contextual_directions = directions * (1.0 + gate)
+        contextual_directions = contextual_directions.unsqueeze(2).unsqueeze(3).expand(n, -1, t, v)
+        return torch.cat((contextual_directions, context), dim=1)
 
 
 class Model(nn.Module):
@@ -750,9 +752,8 @@ class Model(nn.Module):
         directions = self.direction(alpha)
         
         N, C, T, V = z.shape
-        #最终特征构建 ：将语义方向向量与原始Z进行拼接
-        directions = self.context_projection(directions, z)
-        feature = torch.cat((directions.unsqueeze(2).unsqueeze(3).repeat(1, 1, T, V),z),dim=1)
+        #最终特征构建：基于上下文投影融合 motion query 与 Z
+        feature = self.context_projection(directions, z)
 
         
         outputs = self.decoding(feature, x)

@@ -544,7 +544,7 @@ class Direction(nn.Module):
             return out
 
 
-class ContextualDirectionProjection(nn.Module):
+class ContextualFiLM(nn.Module):
     def __init__(self, direction_dim, context_dim, attn_dim=None, dropout=0.0):
         super().__init__()
         if attn_dim is None:
@@ -554,7 +554,7 @@ class ContextualDirectionProjection(nn.Module):
         self.v_proj = nn.Linear(context_dim, attn_dim, bias=False)
         self.scale = attn_dim ** -0.5
         self.attn_drop = nn.Dropout(dropout)
-        self.gate_proj = nn.Linear(attn_dim, direction_dim)
+        self.film_proj = nn.Linear(attn_dim, context_dim * 2)
 
     def forward(self, directions, context):
         # directions: [N, D], context: [N, C, T, V]
@@ -567,10 +567,11 @@ class ContextualDirectionProjection(nn.Module):
         attn = torch.softmax(attn, dim=-1)
         attn = self.attn_drop(attn)
         context_vec = torch.bmm(attn, v).squeeze(1)  # [N, A]
-        gate = torch.tanh(self.gate_proj(context_vec))
-        contextual_directions = directions * (1.0 + gate)
-        contextual_directions = contextual_directions.unsqueeze(2).unsqueeze(3).expand(n, -1, t, v)
-        return torch.cat((contextual_directions, context), dim=1)
+        gamma_beta = self.film_proj(context_vec)
+        gamma, beta = gamma_beta.chunk(2, dim=-1)
+        gamma = torch.tanh(gamma).view(n, c, 1, 1)
+        beta = beta.view(n, c, 1, 1)
+        return context * (1.0 + gamma) + beta
 
 
 class Model(nn.Module):
@@ -635,7 +636,7 @@ class Model(nn.Module):
         direction_dim = self.direction.weight.shape[0]
         context_dim = self.st_gcnns_encoder_past_motion[-1].tcn[0].out_channels
         attn_dim = min(direction_dim, context_dim)
-        self.context_projection = ContextualDirectionProjection(
+        self.context_film = ContextualFiLM(
             direction_dim=direction_dim,
             context_dim=context_dim,
             attn_dim=attn_dim,
@@ -645,7 +646,7 @@ class Model(nn.Module):
         self.st_gcnns_decoder=nn.ModuleList()
 
         #4
-        self.st_gcnns_decoder.append(ST_GCNN_layer(128+256,128,[3,1],1,self.output_len,
+        self.st_gcnns_decoder.append(ST_GCNN_layer(128,128,[3,1],1,self.output_len,
                                                joints_to_consider,st_gcnn_dropout, version=1, pose_info=pose_info)) 
         self.st_gcnns_decoder[-1].gcn.A = self.st_gcnns_encoder_past_motion[-2].gcn.A
         
@@ -752,8 +753,8 @@ class Model(nn.Module):
         directions = self.direction(alpha)
         
         N, C, T, V = z.shape
-        #最终特征构建：基于上下文投影融合 motion query 与 Z
-        feature = self.context_projection(directions, z)
+        #最终特征构建：用上下文感知的 FiLM 调制 z
+        feature = self.context_film(directions, z)
 
         
         outputs = self.decoding(feature, x)

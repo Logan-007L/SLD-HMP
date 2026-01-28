@@ -544,17 +544,22 @@ class Direction(nn.Module):
             return out
 
 
-class ContextualFiLM(nn.Module):
-    def __init__(self, direction_dim, context_dim, attn_dim=None, dropout=0.0):
+class ContextualCrossAttention(nn.Module):
+    def __init__(self, direction_dim, context_dim, attn_dim=None, out_dim=None, dropout=0.0):
         super().__init__()
         if attn_dim is None:
-            attn_dim = direction_dim
+            attn_dim = min(direction_dim, context_dim)
+        if out_dim is None:
+            out_dim = attn_dim
         self.q_proj = nn.Linear(direction_dim, attn_dim, bias=False)
         self.k_proj = nn.Linear(context_dim, attn_dim, bias=False)
         self.v_proj = nn.Linear(context_dim, attn_dim, bias=False)
         self.scale = attn_dim ** -0.5
         self.attn_drop = nn.Dropout(dropout)
-        self.film_proj = nn.Linear(attn_dim, context_dim * 2)
+        if out_dim == attn_dim:
+            self.out_proj = nn.Identity()
+        else:
+            self.out_proj = nn.Linear(attn_dim, out_dim, bias=False)
 
     def forward(self, directions, context):
         # directions: [N, D], context: [N, C, T, V]
@@ -567,11 +572,7 @@ class ContextualFiLM(nn.Module):
         attn = torch.softmax(attn, dim=-1)
         attn = self.attn_drop(attn)
         context_vec = torch.bmm(attn, v).squeeze(1)  # [N, A]
-        gamma_beta = self.film_proj(context_vec)
-        gamma, beta = gamma_beta.chunk(2, dim=-1)
-        gamma = torch.tanh(gamma).view(n, c, 1, 1)
-        beta = beta.view(n, c, 1, 1)
-        return context * (1.0 + gamma) + beta
+        return self.out_proj(context_vec)
 
 
 class Model(nn.Module):
@@ -636,17 +637,20 @@ class Model(nn.Module):
         direction_dim = self.direction.weight.shape[0]
         context_dim = self.st_gcnns_encoder_past_motion[-1].tcn[0].out_channels
         attn_dim = min(direction_dim, context_dim)
-        self.context_film = ContextualFiLM(
+        attn_out_dim = attn_dim
+        self.context_attn = ContextualCrossAttention(
             direction_dim=direction_dim,
             context_dim=context_dim,
             attn_dim=attn_dim,
+            out_dim=attn_out_dim,
             dropout=st_gcnn_dropout,
         )
         
         self.st_gcnns_decoder=nn.ModuleList()
 
         #4
-        self.st_gcnns_decoder.append(ST_GCNN_layer(128,128,[3,1],1,self.output_len,
+        decoder_in_channels = direction_dim + context_dim + attn_out_dim
+        self.st_gcnns_decoder.append(ST_GCNN_layer(decoder_in_channels,128,[3,1],1,self.output_len,
                                                joints_to_consider,st_gcnn_dropout, version=1, pose_info=pose_info)) 
         self.st_gcnns_decoder[-1].gcn.A = self.st_gcnns_encoder_past_motion[-2].gcn.A
         
@@ -753,8 +757,11 @@ class Model(nn.Module):
         directions = self.direction(alpha)
         
         N, C, T, V = z.shape
-        #最终特征构建：用上下文感知的 FiLM 调制 z
-        feature = self.context_film(directions, z)
+        #最终特征构建：拼接 directions、z 与 cross-attention 产出
+        attn_out = self.context_attn(directions, z)
+        directions_feat = directions.unsqueeze(2).unsqueeze(3).repeat(1, 1, T, V)
+        attn_feat = attn_out.unsqueeze(2).unsqueeze(3).repeat(1, 1, T, V)
+        feature = torch.cat((directions_feat, z, attn_feat), dim=1)
 
         
         outputs = self.decoding(feature, x)

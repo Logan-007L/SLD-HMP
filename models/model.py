@@ -645,11 +645,17 @@ class Model(nn.Module):
             out_dim=attn_out_dim,
             dropout=st_gcnn_dropout,
         )
+        fused_in_channels = direction_dim + context_dim + attn_out_dim
+        fused_out_channels = direction_dim + context_dim
+        self.feature_fuse = nn.Sequential(
+            nn.Conv2d(fused_in_channels, fused_out_channels, kernel_size=1, bias=True),
+            nn.PReLU(),
+        )
         
         self.st_gcnns_decoder=nn.ModuleList()
 
         #4
-        decoder_in_channels = direction_dim + context_dim + attn_out_dim
+        decoder_in_channels = direction_dim + context_dim
         self.st_gcnns_decoder.append(ST_GCNN_layer(decoder_in_channels,128,[3,1],1,self.output_len,
                                                joints_to_consider,st_gcnn_dropout, version=1, pose_info=pose_info)) 
         self.st_gcnns_decoder[-1].gcn.A = self.st_gcnns_encoder_past_motion[-2].gcn.A
@@ -762,6 +768,7 @@ class Model(nn.Module):
         directions_feat = directions.unsqueeze(2).unsqueeze(3).repeat(1, 1, T, V)
         attn_feat = attn_out.unsqueeze(2).unsqueeze(3).repeat(1, 1, T, V)
         feature = torch.cat((directions_feat, z, attn_feat), dim=1)
+        feature = self.feature_fuse(feature)
 
         
         outputs = self.decoding(feature, x)

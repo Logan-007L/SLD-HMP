@@ -651,6 +651,7 @@ class Model(nn.Module):
             nn.Conv2d(fused_in_channels, fused_out_channels, kernel_size=1, bias=True),
             nn.PReLU(),
         )
+        self.attn_scale = 1.0
         
         self.st_gcnns_decoder=nn.ModuleList()
 
@@ -740,7 +741,7 @@ class Model(nn.Module):
         return outputs #[75, 800, 42]
 
     
-    def forward(self, x, z=None,epoch=None):
+    def forward(self, x, z=None,epoch=None, attn_scale=None):
         bs = x.shape[1]
         #将编码后的Z进行重复，生成多个候选预测（nk表示候选预测的数量）
         z = self.encode_past_motion(x).repeat_interleave(self.nk,dim=0)
@@ -765,6 +766,8 @@ class Model(nn.Module):
         N, C, T, V = z.shape
         #最终特征构建：拼接 directions、z 与 cross-attention 产出
         attn_out = self.context_attn(directions, z)
+        scale = self.attn_scale if attn_scale is None else attn_scale
+        attn_out = attn_out * attn_out.new_tensor(scale)
         directions_feat = directions.unsqueeze(2).unsqueeze(3).repeat(1, 1, T, V)
         attn_feat = attn_out.unsqueeze(2).unsqueeze(3).repeat(1, 1, T, V)
         feature = torch.cat((directions_feat, z, attn_feat), dim=1)

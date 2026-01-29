@@ -638,7 +638,7 @@ class Model(nn.Module):
         direction_dim = self.direction.weight.shape[0]
         context_dim = self.st_gcnns_encoder_past_motion[-1].tcn[0].out_channels
         attn_dim = min(direction_dim, context_dim)
-        attn_out_dim = attn_dim
+        attn_out_dim = direction_dim
         self.context_attn = ContextualCrossAttention(
             direction_dim=direction_dim,
             context_dim=context_dim,
@@ -652,12 +652,6 @@ class Model(nn.Module):
             attn_dim=min(self.anchor_dim, context_dim),
             out_dim=self.anchor_dim,
             dropout=st_gcnn_dropout,
-        )
-        fused_in_channels = direction_dim + context_dim + attn_out_dim
-        fused_out_channels = direction_dim + context_dim
-        self.feature_fuse = nn.Sequential(
-            nn.Conv2d(fused_in_channels, fused_out_channels, kernel_size=1, bias=True),
-            nn.PReLU(),
         )
         self.attn_scale = 1.0
         
@@ -774,14 +768,13 @@ class Model(nn.Module):
         directions = self.direction(alpha)
         
         N, C, T, V = z.shape
-        #最终特征构建：拼接 directions、z 与 cross-attention 产出
+        #最终特征构建：direction 与 attn 先残差融合，再与 z 拼接
         attn_out = self.context_attn(directions, z)
         scale = self.attn_scale if attn_scale is None else attn_scale
         attn_out = attn_out * attn_out.new_tensor(scale)
-        directions_feat = directions.unsqueeze(2).unsqueeze(3).repeat(1, 1, T, V)
-        attn_feat = attn_out.unsqueeze(2).unsqueeze(3).repeat(1, 1, T, V)
-        feature = torch.cat((directions_feat, z, attn_feat), dim=1)
-        feature = self.feature_fuse(feature)
+        directions_fused = directions + attn_out
+        directions_feat = directions_fused.unsqueeze(2).unsqueeze(3).repeat(1, 1, T, V)
+        feature = torch.cat((directions_feat, z), dim=1)
 
         
         outputs = self.decoding(feature, x)

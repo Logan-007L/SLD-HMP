@@ -653,7 +653,7 @@ class Model(nn.Module):
             out_dim=self.anchor_dim,
             dropout=st_gcnn_dropout,
         )
-        self.attn_scale = 1.0
+        self.attn_alpha = 1.0
         
         self.st_gcnns_decoder=nn.ModuleList()
 
@@ -743,7 +743,7 @@ class Model(nn.Module):
         return outputs #[75, 800, 42]
 
     
-    def forward(self, x, z=None,epoch=None, attn_scale=None):
+    def forward(self, x, z=None,epoch=None, attn_alpha=None):
         bs = x.shape[1]
         #将编码后的Z进行重复，生成多个候选预测（nk表示候选预测的数量）
         z = self.encode_past_motion(x).repeat_interleave(self.nk,dim=0)
@@ -770,8 +770,8 @@ class Model(nn.Module):
         N, C, T, V = z.shape
         #最终特征构建：direction 与 attn 先残差融合，再与 z 拼接
         attn_out = self.context_attn(directions, z)
-        scale = self.attn_scale if attn_scale is None else attn_scale
-        attn_out = attn_out * attn_out.new_tensor(scale)
+        alpha = self.attn_alpha if attn_alpha is None else attn_alpha
+        attn_out = attn_out * attn_out.new_tensor(alpha)
         directions_fused = directions + attn_out
         directions_feat = directions_fused.unsqueeze(2).unsqueeze(3).repeat(1, 1, T, V)
         feature = torch.cat((directions_feat, z), dim=1)

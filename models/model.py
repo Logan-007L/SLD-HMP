@@ -597,6 +597,7 @@ class Model(nn.Module):
         stdv_anchor = 1. / math.sqrt(128)
         for i in range(self.num_anchor):
             self.anchor_input[f'anchor_{i}'] = nn.Parameter(torch.FloatTensor(1, 128).uniform_(-stdv_anchor, stdv_anchor))
+        self.anchor_dim = self.anchor_input['anchor_0'].shape[1]
         
 
         self.st_gcnns_encoder_past_motion=nn.ModuleList()
@@ -643,6 +644,13 @@ class Model(nn.Module):
             context_dim=context_dim,
             attn_dim=attn_dim,
             out_dim=attn_out_dim,
+            dropout=st_gcnn_dropout,
+        )
+        self.anchor_attn = ContextualCrossAttention(
+            direction_dim=self.anchor_dim,
+            context_dim=context_dim,
+            attn_dim=min(self.anchor_dim, context_dim),
+            out_dim=self.anchor_dim,
             dropout=st_gcnn_dropout,
         )
         fused_in_channels = direction_dim + context_dim + attn_out_dim
@@ -750,9 +758,11 @@ class Model(nn.Module):
         #anchor_input 即为原论文的motion query
         anchors_input = replicated_parameters.repeat(bs, 1)
 
-        #将锚点输入与Z进行拼接，形成 z1 ，然后通过多个时空图卷积网络层( st_gcnns_compress )进行处理，这些层用于压缩特征并学习锚点与输入特征之间的关系。
+        #将锚点输入与Z进行cross-attention并残差融合，再与Z拼接形成 z1
         # 这里最终anchor_input的形状是(bs*50, 128, self.output_len, self.num_joints)
-        z1 = torch.cat((anchors_input.unsqueeze(2).unsqueeze(3).repeat(1, 1, self.output_len, self.num_joints),z),dim=1)
+        anchor_attn = self.anchor_attn(anchors_input, z)
+        anchors_fused = anchors_input + anchor_attn
+        z1 = torch.cat((anchors_fused.unsqueeze(2).unsqueeze(3).repeat(1, 1, self.output_len, self.num_joints),z),dim=1)
         
         #原文中提到的QLP
         for gcn in (self.st_gcnns_compress): #0-3 layer

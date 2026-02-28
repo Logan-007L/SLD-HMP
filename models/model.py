@@ -542,7 +542,72 @@ class Direction(nn.Module):
             out = torch.sum(out, dim=1)
 
             return out
+class ST_GAT_Compress_layer(nn.Module):
+    def __init__(self,
+                 in_channels,
+                 out_channels,
+                 kernel_size,
+                 stride,
+                 time_dim,
+                 joints_dim,
+                 dropout,
+                 bias=True,
+                 version=0,
+                 pose_info=None,
+                 num_heads=4):
 
+        super().__init__()
+
+        def _to_pair(val):
+            if isinstance(val, int):
+                return (val, val)
+            if isinstance(val, (list, tuple)) and len(val) == 2:
+                return (val[0], val[1])
+            raise ValueError("kernel_size/stride 必须为整数或长度为2的序列")
+
+        self.kernel_size = _to_pair(kernel_size)
+        self.stride = _to_pair(stride)
+        padding = tuple((k - 1) // 2 for k in self.kernel_size)
+
+        if version == 0:
+            self.gcn = ConvTemporalGraphical(time_dim, joints_dim)
+        elif version == 1:
+            self.gcn = ConvTemporalGraphicalV1(time_dim, joints_dim, pose_info=pose_info)
+        else:
+            raise ValueError(f'Unsupported version {version} for ST_GAT_Compress_layer')
+
+        self.spatial_attention = SpatialGraphAttention(in_channels, num_heads=num_heads, attn_dropout=dropout)
+
+        self.tcn = nn.Sequential(
+            nn.Conv2d(
+                in_channels,
+                out_channels,
+                self.kernel_size,
+                self.stride,
+                padding,
+                bias=bias,
+            ),
+            nn.BatchNorm2d(out_channels),
+            nn.Dropout(dropout, inplace=True),
+        )
+
+        if self.stride != (1, 1) or in_channels != out_channels:
+            self.residual = nn.Sequential(
+                nn.Conv2d(in_channels, out_channels, kernel_size=1, stride=self.stride, bias=bias),
+                nn.BatchNorm2d(out_channels),
+            )
+        else:
+            self.residual = nn.Identity()
+
+        self.prelu = nn.PReLU()
+
+    def forward(self, x):
+        res = self.residual(x)
+        x_physical = self.gcn(x)
+        x_semantic = self.spatial_attention(x)
+        x_fused = x_physical + x_semantic
+        x_out = self.tcn(x_fused)
+        return self.prelu(x_out + res)
 
 class Model(nn.Module):
     def __init__(self, nx, ny,input_channels,st_gcnn_dropout,
@@ -584,13 +649,13 @@ class Model(nn.Module):
         
         self.st_gcnns_compress=nn.ModuleList()
         #0
-        self.st_gcnns_compress.append(ST_GCNN_layer_down(256,512,[2,2],2,self.output_len,
+        self.st_gcnns_compress.append(ST_GAT_Compress_layer(256,512,[2,2],2,self.output_len,
                                                joints_to_consider,st_gcnn_dropout,  pose_info=pose_info))
         #2
-        self.st_gcnns_compress.append(ST_GCNN_layer_down(512,768,[2,2],2,self.output_len//2,
+        self.st_gcnns_compress.append(ST_GAT_Compress_layer(512,768,[2,2],2,self.output_len//2,
                                                joints_to_consider//2,st_gcnn_dropout, pose_info=pose_info))
 
-        self.st_gcnns_compress.append(ST_GCNN_layer_down(768,1024,[2,2],2,self.output_len//4,
+        self.st_gcnns_compress.append(ST_GAT_Compress_layer(768,1024,[2,2],2,self.output_len//4,
                                                joints_to_consider//4,st_gcnn_dropout, pose_info=pose_info))
        
        

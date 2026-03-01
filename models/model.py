@@ -609,6 +609,37 @@ class ST_GAT_Compress_layer(nn.Module):
         x_out = self.tcn(x_fused)
         return self.prelu(x_out + res)
 
+class ContextualCrossAttention(nn.Module):
+    def __init__(self, direction_dim, context_dim, attn_dim=None, out_dim=None, dropout=0.0):
+        super().__init__()
+        if attn_dim is None:
+            attn_dim = min(direction_dim, context_dim)
+        if out_dim is None:
+            out_dim = attn_dim
+        self.q_proj = nn.Linear(direction_dim, attn_dim, bias=False)
+        self.k_proj = nn.Linear(context_dim, attn_dim, bias=False)
+        self.v_proj = nn.Linear(context_dim, attn_dim, bias=False)
+        self.scale = attn_dim ** -0.5
+        self.attn_drop = nn.Dropout(dropout)
+        if out_dim == attn_dim:
+            self.out_proj = nn.Identity()
+        else:
+            self.out_proj = nn.Linear(attn_dim, out_dim, bias=False)
+
+    def forward(self, directions, context):
+        # directions: [N, D], context: [N, C, T, V]
+        n, c, t, v = context.shape
+        context_tokens = context.permute(0, 2, 3, 1).reshape(n, t * v, c)
+        q = self.q_proj(directions).unsqueeze(1)  # [N, 1, A]
+        k = self.k_proj(context_tokens)  # [N, L, A]
+        v = self.v_proj(context_tokens)  # [N, L, A]
+        attn = torch.bmm(q, k.transpose(1, 2)) * self.scale
+        attn = torch.softmax(attn, dim=-1)
+        attn = self.attn_drop(attn)
+        context_vec = torch.bmm(attn, v).squeeze(1)  # [N, A]
+        return self.out_proj(context_vec)
+
+
 class Model(nn.Module):
     def __init__(self, nx, ny,input_channels,st_gcnn_dropout,
                  joints_to_consider,
@@ -631,6 +662,7 @@ class Model(nn.Module):
         stdv_anchor = 1. / math.sqrt(128)
         for i in range(self.num_anchor):
             self.anchor_input[f'anchor_{i}'] = nn.Parameter(torch.FloatTensor(1, 128).uniform_(-stdv_anchor, stdv_anchor))
+        self.anchor_dim = self.anchor_input['anchor_0'].shape[1]
         
 
         self.st_gcnns_encoder_past_motion=nn.ModuleList()
@@ -668,11 +700,31 @@ class Model(nn.Module):
        
         
         self.direction = Direction(motion_dim=self.num_D)
+        direction_dim = self.direction.weight.shape[0]
+        context_dim = self.st_gcnns_encoder_past_motion[-1].tcn[0].out_channels
+        attn_dim = min(direction_dim, context_dim)
+        attn_out_dim = direction_dim
+        self.context_attn = ContextualCrossAttention(
+            direction_dim=direction_dim,
+            context_dim=context_dim,
+            attn_dim=attn_dim,
+            out_dim=attn_out_dim,
+            dropout=st_gcnn_dropout,
+        )
+        self.anchor_attn = ContextualCrossAttention(
+            direction_dim=self.anchor_dim,
+            context_dim=context_dim,
+            attn_dim=min(self.anchor_dim, context_dim),
+            out_dim=self.anchor_dim,
+            dropout=st_gcnn_dropout,
+        )
+        self.attn_alpha = 1.0
         
         self.st_gcnns_decoder=nn.ModuleList()
 
         #4
-        self.st_gcnns_decoder.append(ST_GCNN_layer(128+256,128,[3,1],1,self.output_len,
+        decoder_in_channels = direction_dim + context_dim
+        self.st_gcnns_decoder.append(ST_GCNN_layer(decoder_in_channels,128,[3,1],1,self.output_len,
                                                joints_to_consider,st_gcnn_dropout, version=1, pose_info=pose_info)) 
         self.st_gcnns_decoder[-1].gcn.A = self.st_gcnns_encoder_past_motion[-2].gcn.A
         
@@ -756,7 +808,7 @@ class Model(nn.Module):
         return outputs #[75, 800, 42]
 
     
-    def forward(self, x, z=None,epoch=None):
+    def forward(self, x, z=None,epoch=None, attn_alpha=None):
         bs = x.shape[1]
         #将编码后的Z进行重复，生成多个候选预测（nk表示候选预测的数量）
         z = self.encode_past_motion(x).repeat_interleave(self.nk,dim=0)
@@ -765,9 +817,11 @@ class Model(nn.Module):
         #anchor_input 即为原论文的motion query
         anchors_input = replicated_parameters.repeat(bs, 1)
 
-        #将锚点输入与Z进行拼接，形成 z1 ，然后通过多个时空图卷积网络层( st_gcnns_compress )进行处理，这些层用于压缩特征并学习锚点与输入特征之间的关系。
+        #将锚点输入与Z进行cross-attention并残差融合，再与Z拼接形成 z1
         # 这里最终anchor_input的形状是(bs*50, 128, self.output_len, self.num_joints)
-        z1 = torch.cat((anchors_input.unsqueeze(2).unsqueeze(3).repeat(1, 1, self.output_len, self.num_joints),z),dim=1)
+        anchor_attn = self.anchor_attn(anchors_input, z)
+        anchors_fused = anchors_input + anchor_attn
+        z1 = torch.cat((anchors_fused.unsqueeze(2).unsqueeze(3).repeat(1, 1, self.output_len, self.num_joints),z),dim=1)
         
         #原文中提到的QLP
         for gcn in (self.st_gcnns_compress): #0-3 layer
@@ -779,8 +833,13 @@ class Model(nn.Module):
         directions = self.direction(alpha)
         
         N, C, T, V = z.shape
-        #最终特征构建 ：将语义方向向量与原始Z进行拼接
-        feature = torch.cat((directions.unsqueeze(2).unsqueeze(3).repeat(1, 1, T, V),z),dim=1)
+        #最终特征构建：direction 与 attn 先残差融合，再与 z 拼接
+        attn_out = self.context_attn(directions, z)
+        alpha = self.attn_alpha if attn_alpha is None else attn_alpha
+        attn_out = attn_out * attn_out.new_tensor(alpha)
+        directions_fused = directions + attn_out
+        directions_feat = directions_fused.unsqueeze(2).unsqueeze(3).repeat(1, 1, T, V)
+        feature = torch.cat((directions_feat, z), dim=1)
 
         
         outputs = self.decoding(feature, x)

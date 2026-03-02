@@ -43,6 +43,37 @@ python main.py --cfg [h36m/humaneva] --gpu_index 0
  python main.py --cfg [h36m/humaneva] --mode viz --iter 500 --gpu_index 0
   ```
 
+### Model Params / FLOPs / Inference Time (table file)
+You can use `profile_model_table.py` to read an input CSV table and append:
+- Params
+- FLOPs
+- Inference Time (ms)
+
+1) Prepare an input CSV file (for example `profile_input.csv`, or use `profile_input_template.csv`):
+```csv
+model_name,cfg,batch_size
+ours_h36m,h36m,1
+ours_humaneva,humaneva,1
+```
+
+2) Run:
+```bash
+python profile_model_table.py \
+  --input-table profile_input.csv \
+  --output-table profile_output.csv \
+  --device auto \
+  --input-mode history \
+  --warmup 20 \
+  --repeat 50
+```
+
+3) The output CSV will append columns such as:
+`params_total`, `params_million`, `flops`, `flops_g`, `inference_time_ms`.
+
+Notes:
+- `input-mode history` matches test-time usage in `main.py` (`model(X)` with only history frames).
+- FLOPs is computed with `thop` if available; otherwise it falls back to `torch.profiler`.
+
  ### Acknowledgments
  
  This code is based on the implementations of [STARS](https://github.com/Sirui-Xu/STARS).

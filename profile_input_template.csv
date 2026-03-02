@@ -1,0 +1,3 @@
+model_name,cfg,batch_size,input_mode,warmup,repeat,device
+ours_h36m,h36m,1,history,20,50,auto
+ours_humaneva,humaneva,1,history,20,50,auto

@@ -519,29 +519,38 @@ class ST_GAT_layer(nn.Module):
         return self.prelu(x_out + res)
 
 
-class Direction(nn.Module):
-    def __init__(self, motion_dim):
-        super(Direction, self).__init__()
+        
+class ST_GAT_decoder_layer(ST_GAT_layer):
+    """
+    Decoder专用的ST-GAT层，保持与原ST_GCNN decoder一致的接口，
+    方便复用编码阶段学习到的图结构参数。
+    """
+    def __init__(self,
+                 in_channels,
+                 out_channels,
+                 kernel_size,
+                 stride,
+                 time_dim,
+                 joints_dim,
+                 dropout,
+                 bias=True,
+                 version=0,
+                 pose_info=None,
+                 num_heads=4):
+        super().__init__(
+            in_channels=in_channels,
+            out_channels=out_channels,
+            kernel_size=kernel_size,
+            stride=stride,
+            time_dim=time_dim,
+            joints_dim=joints_dim,
+            dropout=dropout,
+            bias=bias,
+            version=version,
+            pose_info=pose_info,
+            num_heads=num_heads,
+        )
 
-        #创建一个形状为 (256, motion_dim) 的随机权重参数矩阵
-        self.weight = nn.Parameter(torch.randn(256, motion_dim))
-
-    def forward(self, input):
-        # input: (bs*t) x 256
-
-        weight = self.weight + 1e-8
-        #执行QR分解获取正交基向量（通过 torch.qr() ），确保生成的方向向量相互正交
-        Q, R = torch.qr(weight)  # get eignvector, orthogonal [n1, n2, n3, n4]
-
-        if input is None:
-            return Q
-        else:
-            #将输入转换为对角矩阵，与正交基矩阵进行矩阵乘法运算，然后求和，生成方向向量
-            input_diag = torch.diag_embed(input)  # alpha, diagonal matrix
-            out = torch.matmul(input_diag, Q.T)
-            out = torch.sum(out, dim=1)
-
-            return out
 class ST_GAT_Compress_layer(nn.Module):
     def __init__(self,
                  in_channels,
@@ -592,10 +601,13 @@ class ST_GAT_Compress_layer(nn.Module):
         )
 
         if self.stride != (1, 1) or in_channels != out_channels:
-            self.residual = nn.Sequential(
-                nn.Conv2d(in_channels, out_channels, kernel_size=1, stride=self.stride, bias=bias),
+            residual_layers = [
+                nn.Conv2d(in_channels, out_channels, kernel_size=1, stride=(1, 1), bias=bias),
                 nn.BatchNorm2d(out_channels),
-            )
+            ]
+            if self.stride != (1, 1):
+                residual_layers.append(nn.AvgPool2d(kernel_size=self.stride, stride=self.stride))
+            self.residual = nn.Sequential(*residual_layers)
         else:
             self.residual = nn.Identity()
 
@@ -608,6 +620,32 @@ class ST_GAT_Compress_layer(nn.Module):
         x_fused = x_physical + x_semantic
         x_out = self.tcn(x_fused)
         return self.prelu(x_out + res)
+
+
+class Direction(nn.Module):
+    def __init__(self, motion_dim):
+        super(Direction, self).__init__()
+
+        #创建一个形状为 (256, motion_dim) 的随机权重参数矩阵
+        self.weight = nn.Parameter(torch.randn(256, motion_dim))
+
+    def forward(self, input):
+        # input: (bs*t) x 256
+
+        weight = self.weight + 1e-8
+        #执行QR分解获取正交基向量（通过 torch.qr() ），确保生成的方向向量相互正交
+        Q, R = torch.qr(weight)  # get eignvector, orthogonal [n1, n2, n3, n4]
+
+        if input is None:
+            return Q
+        else:
+            #将输入转换为对角矩阵，与正交基矩阵进行矩阵乘法运算，然后求和，生成方向向量
+            input_diag = torch.diag_embed(input)  # alpha, diagonal matrix
+            out = torch.matmul(input_diag, Q.T)
+            out = torch.sum(out, dim=1)
+
+            return out
+
 
 class Model(nn.Module):
     def __init__(self, nx, ny,input_channels,st_gcnn_dropout,
@@ -627,6 +665,8 @@ class Model(nn.Module):
             self.t_pred = 60
         self.nk = 50
         self.num_anchor = self.nk
+        self.anchor_feature_dim = 128
+        self.feature_dim = self.anchor_feature_dim
         self.anchor_input = nn.ParameterDict()
         stdv_anchor = 1. / math.sqrt(128)
         for i in range(self.num_anchor):
@@ -754,12 +794,55 @@ class Model(nn.Module):
         outputs = torch.matmul(idct_m[:, :self.output_len], output).reshape([N, -1, C, V]).permute(1, 0, 3, 2).contiguous().view(-1,N,C*V)
        
         return outputs #[75, 800, 42]
+    def _build_skeleton_correlation_matrix(self, pose_info):
+            if pose_info is None:
+                return None
+            parents = pose_info.get("parents")
+            keep_joints = pose_info.get("keep_joints")
+            if parents is None:
+                return None
+            if keep_joints is None or len(keep_joints) == 0:
+                keep_joints = list(range(self.num_joints))
+            keep_joints = list(map(int, keep_joints))
+            if len(keep_joints) > self.num_joints:
+                keep_joints = keep_joints[: self.num_joints]
+            joint_map = {joint: idx for idx, joint in enumerate(keep_joints)}
+            num_joints = len(joint_map)
+            if num_joints == 0:
+                return None
+            adjacency = torch.zeros((num_joints, num_joints), dtype=torch.float32)
+            for joint in keep_joints:
+                joint_idx = joint_map[joint]
+                parent = parents[joint]
+                if parent == -1 or parent not in joint_map:
+                    continue
+                parent_idx = joint_map[parent]
+                adjacency[joint_idx, parent_idx] = 1.0
+                adjacency[parent_idx, joint_idx] = 1.0
+            adjacency = adjacency + torch.eye(num_joints, dtype=torch.float32)
+            eigenvalues = torch.linalg.eigvalsh(adjacency)
+            lambda_min = torch.min(eigenvalues)
+            lambda_max = torch.max(eigenvalues)
+            denom = (lambda_max - lambda_min).clamp_min(1e-6)
+            sigma = adjacency - lambda_min * torch.eye(num_joints, dtype=torch.float32)
+            sigma = sigma / denom
+            return sigma
 
-    
+    def _sample_structured_noise(self, total_queries, device):
+        if self.L_cholesky.numel() == 0:
+            joint_noise = torch.randn(total_queries, self.num_joints, device=device)
+        else:
+            epsilon = torch.randn(total_queries, self.num_joints, device=device)
+            L = self.L_cholesky.to(device)
+            joint_noise = torch.matmul(epsilon, L.t())
+        mapped_noise = self.structure_proj(joint_noise)
+        return mapped_noise
+
     def forward(self, x, z=None,epoch=None):
         bs = x.shape[1]
         #将编码后的Z进行重复，生成多个候选预测（nk表示候选预测的数量）
         z = self.encode_past_motion(x).repeat_interleave(self.nk,dim=0)
+
         #构建锚点参数并将其扩展为适合批处理的形状，生成 anchors_input 。这些锚点作为潜在空间中的参考点，用于引导不同的动作预测方向。
         replicated_parameters = torch.cat([self.anchor_input[f'anchor_{i}'].expand(self.nk//self.num_anchor, -1) for i in range(self.num_anchor)], dim=0)
         #anchor_input 即为原论文的motion query
@@ -801,6 +884,3 @@ class Model(nn.Module):
             dct_m = torch.from_numpy(dct_m)
             idct_m = torch.from_numpy(idct_m)
         return dct_m, idct_m  
-
-
-

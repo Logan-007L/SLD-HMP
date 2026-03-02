@@ -41,6 +41,12 @@ def parse_int(value: str, default_value: int) -> int:
     return int(float(value))
 
 
+def to_float_text(value: float) -> str:
+    if value is None or math.isnan(value) or math.isinf(value):
+        return ""
+    return f"{value:.6f}"
+
+
 def resolve_device(device_text: str) -> torch.device:
     if device_text == "auto":
         return torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -199,6 +205,9 @@ def process_one_row(
         warmup=warmup,
         repeat=repeat,
     )
+    params_m = total_params / 1e6
+    flops_g = math.nan if math.isnan(flops) else flops / 1e9
+    inference_fps = math.nan if inference_time_ms <= 0 else (1000.0 / inference_time_ms)
 
     out["cfg"] = cfg_id
     out["dataset"] = cfg.dataset
@@ -208,20 +217,29 @@ def process_one_row(
     out["warmup"] = str(warmup)
     out["repeat"] = str(repeat)
     out["t_input"] = str(t_in)
-    out["params_total"] = str(total_params)
-    out["params_trainable"] = str(trainable_params)
-    out["params_million"] = f"{total_params / 1e6:.6f}"
-    out["flops"] = "" if math.isnan(flops) else f"{flops:.0f}"
-    out["flops_g"] = "" if math.isnan(flops) else f"{flops / 1e9:.6f}"
+    out["Params(M)"] = to_float_text(params_m)
+    out["FLOPs(G)"] = to_float_text(flops_g)
+    out["Inference Time(ms)"] = to_float_text(inference_time_ms)
+    out["Inference Speed(fps)"] = to_float_text(inference_fps)
+    out["Inference Time(ms/fps)"] = (
+        ""
+        if math.isnan(inference_fps)
+        else f"{inference_time_ms:.6f} ms / {inference_fps:.6f} fps"
+    )
+
+    # Keep raw values for traceability when users need exact counts.
+    out["params_total_raw"] = str(total_params)
+    out["params_trainable_raw"] = str(trainable_params)
+    out["flops_raw"] = "" if math.isnan(flops) else f"{flops:.0f}"
     out["flops_backend"] = flops_backend
-    out["inference_time_ms"] = f"{inference_time_ms:.6f}"
     return out
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Read a model table CSV file and append Params/FLOPs/Inference Time columns. "
+            "Read a model table CSV file and append Params(M), FLOPs(G), "
+            "Inference Time(ms/fps) columns. "
             "Input CSV must contain at least one row and either a 'cfg' column or --cfg."
         )
     )
@@ -279,13 +297,15 @@ def main() -> None:
         "warmup",
         "repeat",
         "t_input",
-        "params_total",
-        "params_trainable",
-        "params_million",
-        "flops",
-        "flops_g",
+        "Params(M)",
+        "FLOPs(G)",
+        "Inference Time(ms)",
+        "Inference Speed(fps)",
+        "Inference Time(ms/fps)",
+        "params_total_raw",
+        "params_trainable_raw",
+        "flops_raw",
         "flops_backend",
-        "inference_time_ms",
     ]
     output_fields = list(input_fields)
     for col in extra_columns:

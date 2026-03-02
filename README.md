@@ -45,9 +45,9 @@ python main.py --cfg [h36m/humaneva] --gpu_index 0
 
 ### Model Params / FLOPs / Inference Time (table file)
 You can use `profile_model_table.py` to read an input CSV table and append:
-- Params
-- FLOPs
-- Inference Time (ms)
+- Params (M)
+- FLOPs (G)
+- Inference Time (ms / fps)
 
 1) Prepare an input CSV file (for example `profile_input.csv`, or use `profile_input_template.csv`):
 ```csv
@@ -68,7 +68,7 @@ python profile_model_table.py \
 ```
 
 3) The output CSV will append columns such as:
-`params_total`, `params_million`, `flops`, `flops_g`, `inference_time_ms`.
+`Params(M)`, `FLOPs(G)`, `Inference Time(ms)`, `Inference Speed(fps)`.
 
 Notes:
 - `input-mode history` matches test-time usage in `main.py` (`model(X)` with only history frames).

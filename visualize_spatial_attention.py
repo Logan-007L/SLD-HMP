@@ -1,4 +1,5 @@
 import argparse
+import json
 import os
 import pickle
 import random
@@ -71,6 +72,64 @@ def build_joint_labels(cfg, dataset, num_joints):
     if len(labels) != num_joints:
         labels = [f'J{i}' for i in range(num_joints)]
     return labels
+
+
+def compute_attention_stats(attn_matrix):
+    v = attn_matrix.shape[0]
+    eye_mask = np.eye(v, dtype=bool)
+    diag_vals = attn_matrix[eye_mask]
+    offdiag_vals = attn_matrix[~eye_mask]
+    diag_mean = float(diag_vals.mean()) if diag_vals.size > 0 else float('nan')
+    offdiag_mean = float(offdiag_vals.mean()) if offdiag_vals.size > 0 else float('nan')
+    ratio = float(diag_mean / (offdiag_mean + 1e-12))
+    return {
+        'diag_mean': diag_mean,
+        'offdiag_mean': offdiag_mean,
+        'diag_over_offdiag': ratio,
+    }
+
+
+def get_topk_cross_joint_edges(attn_matrix, joint_labels, topk):
+    v = attn_matrix.shape[0]
+    if topk <= 0:
+        return []
+    eye_mask = np.eye(v, dtype=bool)
+    offdiag_indices = np.argwhere(~eye_mask)
+    offdiag_values = attn_matrix[~eye_mask]
+    if offdiag_values.size == 0:
+        return []
+    k = min(topk, offdiag_values.size)
+    top_idx = np.argsort(offdiag_values)[::-1][:k]
+    edges = []
+    for rank, idx in enumerate(top_idx, start=1):
+        q_idx, k_idx = offdiag_indices[idx]
+        edges.append({
+            'rank': rank,
+            'query_idx': int(q_idx),
+            'key_idx': int(k_idx),
+            'query_joint': joint_labels[int(q_idx)] if int(q_idx) < len(joint_labels) else f'J{int(q_idx)}',
+            'key_joint': joint_labels[int(k_idx)] if int(k_idx) < len(joint_labels) else f'J{int(k_idx)}',
+            'weight': float(offdiag_values[idx]),
+        })
+    return edges
+
+
+def annotate_topk_edges(ax, edges):
+    for edge in edges:
+        q_idx = edge['query_idx']
+        k_idx = edge['key_idx']
+        rank = edge['rank']
+        ax.scatter([k_idx], [q_idx], s=90, marker='s', facecolors='none', edgecolors='red', linewidths=1.2)
+        ax.text(
+            k_idx,
+            q_idx,
+            str(rank),
+            color='white',
+            ha='center',
+            va='center',
+            fontsize=7,
+            bbox=dict(facecolor='black', alpha=0.35, pad=0.15, linewidth=0),
+        )
 
 
 def build_dataset(cfg, split):
@@ -160,7 +219,9 @@ def main():
     parser.add_argument('--seed', type=int, default=1)
     parser.add_argument('--save_npy', type=str, default=None, help='保存 [B,H,V,V] 的注意力矩阵路径')
     parser.add_argument('--save_fig', type=str, default=None, help='保存热力图路径')
+    parser.add_argument('--save_stats', type=str, default=None, help='保存统计与top-k边信息的json路径')
     parser.add_argument('--hide_joint_labels', action='store_true', help='隐藏坐标轴关节名称标签')
+    parser.add_argument('--topk_edges', type=int, default=5, help='自动标注top-k跨关节连边（不含对角线）')
     args = parser.parse_args()
     try:
         import matplotlib
@@ -196,8 +257,10 @@ def main():
     action_safe = sanitize_name(action)
     default_npy = os.path.join(default_dir, f'{args.cfg}_{args.split}_{action_safe}_idx{args.sample_index}_start{start}_attn.npy')
     default_fig = os.path.join(default_dir, f'{args.cfg}_{args.split}_{action_safe}_idx{args.sample_index}_start{start}_heatmap.png')
+    default_stats = os.path.join(default_dir, f'{args.cfg}_{args.split}_{action_safe}_idx{args.sample_index}_start{start}_stats.json')
     save_npy = args.save_npy if args.save_npy else default_npy
     save_fig = args.save_fig if args.save_fig else default_fig
+    save_stats = args.save_stats if args.save_stats else default_stats
 
     with torch.no_grad():
         _, _, _, attention_info = model(
@@ -223,34 +286,69 @@ def main():
         heatmap = attn_temporal[0, :, picked_t].mean(dim=0).cpu().numpy()
         time_desc = f't{picked_t}'
 
-    fig = plt.figure(figsize=(7, 6))
-    im = plt.imshow(heatmap, cmap='viridis')
+    joint_labels = build_joint_labels(cfg, dataset, heatmap.shape[0])
+    stats = compute_attention_stats(heatmap)
+    topk_edges = get_topk_cross_joint_edges(heatmap, joint_labels, args.topk_edges)
+
+    fig, ax = plt.subplots(figsize=(7, 6))
+    im = ax.imshow(heatmap, cmap='viridis')
     plt.colorbar(im, fraction=0.046, pad=0.04)
     v = heatmap.shape[0]
     ticks = np.arange(v)
     if args.hide_joint_labels:
-        plt.xticks(ticks)
-        plt.yticks(ticks)
+        ax.set_xticks(ticks)
+        ax.set_yticks(ticks)
     else:
-        joint_labels = build_joint_labels(cfg, dataset, v)
-        plt.xticks(ticks, joint_labels, rotation=45, ha='right', fontsize=8)
-        plt.yticks(ticks, joint_labels, fontsize=8)
+        ax.set_xticks(ticks)
+        ax.set_yticks(ticks)
+        ax.set_xticklabels(joint_labels, rotation=45, ha='right', fontsize=8)
+        ax.set_yticklabels(joint_labels, fontsize=8)
+    annotate_topk_edges(ax, topk_edges)
     if args.hide_joint_labels:
-        plt.xlabel('Key joint index')
-        plt.ylabel('Query joint index')
+        ax.set_xlabel('Key joint index')
+        ax.set_ylabel('Query joint index')
     else:
-        plt.xlabel('Key joint name')
-        plt.ylabel('Query joint name')
-    plt.title(f'Spatial Attention Heatmap ({action}, {time_desc}, V={v})')
+        ax.set_xlabel('Key joint name')
+        ax.set_ylabel('Query joint name')
+    ax.set_title(f'Spatial Attention Heatmap ({action}, {time_desc}, V={v})')
     plt.tight_layout()
     plt.savefig(save_fig, dpi=220)
     plt.close(fig)
+
+    stats_payload = {
+        'action': action,
+        'subject': subject,
+        'clip_start': int(start),
+        'time_desc': time_desc,
+        'matrix_shape': [int(v), int(v)],
+        'stats': stats,
+        'topk_cross_joint_edges': topk_edges,
+    }
+    stats_dir = os.path.dirname(save_stats)
+    if stats_dir != '':
+        os.makedirs(stats_dir, exist_ok=True)
+    with open(save_stats, 'w', encoding='utf-8') as f:
+        json.dump(stats_payload, f, ensure_ascii=False, indent=2)
 
     print(f'[INFO] checkpoint: {checkpoint_path}')
     print(f'[INFO] subject/action: {subject} / {action}, clip_start={start}')
     print(f'[INFO] attention_spatial shape: {tuple(attn_spatial.shape)} (saved to {save_npy})')
     print(f'[INFO] attention_temporal shape: {tuple(attn_temporal.shape)}')
     print(f'[INFO] heatmap ({time_desc}) shape: {heatmap.shape}, saved to {save_fig}')
+    print(
+        '[INFO] stats: '
+        f"diag_mean={stats['diag_mean']:.6f}, "
+        f"offdiag_mean={stats['offdiag_mean']:.6f}, "
+        f"diag/offdiag={stats['diag_over_offdiag']:.6f}"
+    )
+    if len(topk_edges) > 0:
+        print('[INFO] top-k cross-joint edges:')
+        for edge in topk_edges:
+            print(
+                f"  #{edge['rank']}: {edge['query_joint']} (q={edge['query_idx']})"
+                f" -> {edge['key_joint']} (k={edge['key_idx']}), w={edge['weight']:.6f}"
+            )
+    print(f'[INFO] stats json saved to {save_stats}')
 
 
 if __name__ == '__main__':

@@ -5,6 +5,7 @@ import torch
 import torch.nn as nn
 import math
 import numpy as np
+import os
 from torch.nn import functional as F
 def fused_leaky_relu(input, bias, negative_slope=0.2, scale=2 ** 0.5):
     return F.leaky_relu(input + bias, negative_slope) * scale
@@ -443,20 +444,26 @@ class SpatialGraphAttention(nn.Module):
         self.attn_drop = nn.Dropout(attn_dropout)
         self.proj_drop = nn.Dropout(attn_dropout)
 
-    def forward(self, x):
+    def forward(self, x, return_attention=False):
         N, C, T, V = x.shape
         q = self.q_proj(x).view(N, self.num_heads, self.head_dim, T, V).permute(0, 1, 3, 4, 2)
         k = self.k_proj(x).view(N, self.num_heads, self.head_dim, T, V).permute(0, 1, 3, 4, 2)
         v = self.v_proj(x).view(N, self.num_heads, self.head_dim, T, V).permute(0, 1, 3, 4, 2)
 
-        attn = torch.einsum('nhtvd,nhtwd->nhtvw', q, k) * self.scale
-        attn = torch.softmax(attn, dim=-1)
-        attn = self.attn_drop(attn)
+        attn_prob = torch.einsum('nhtvd,nhtwd->nhtvw', q, k) * self.scale
+        attn_prob = torch.softmax(attn_prob, dim=-1)
+        attn = self.attn_drop(attn_prob)
 
         out = torch.einsum('nhtvw,nhtwd->nhtvd', attn, v)
         out = out.permute(0, 1, 4, 2, 3).contiguous().view(N, -1, T, V)
         out = self.out_proj(out)
-        return self.proj_drop(out)
+        out = self.proj_drop(out)
+
+        if return_attention:
+            # [N, H, T, V, V] -> [N, H, V, V]
+            spatial_attn = attn_prob.mean(dim=2)
+            return out, {'attn_temporal': attn_prob, 'attn_spatial': spatial_attn}
+        return out
 
 class ST_GAT_layer(nn.Module):
     def __init__(self,
@@ -509,14 +516,23 @@ class ST_GAT_layer(nn.Module):
             self.residual = nn.Identity()
 
         self.prelu = nn.PReLU()
+        self.last_attention = None
 
-    def forward(self, x):
+    def forward(self, x, return_attention=False):
         res = self.residual(x)
         x_physical = self.gcn(x)
-        x_semantic = self.spatial_attention(x)
+        if return_attention:
+            x_semantic, attn_info = self.spatial_attention(x, return_attention=True)
+            self.last_attention = attn_info
+        else:
+            x_semantic = self.spatial_attention(x, return_attention=False)
+            self.last_attention = None
         x_fused = x_physical + x_semantic
         x_out = self.tcn(x_fused)
-        return self.prelu(x_out + res)
+        x_out = self.prelu(x_out + res)
+        if return_attention:
+            return x_out, attn_info
+        return x_out
 
 
         
@@ -612,14 +628,23 @@ class ST_GAT_Compress_layer(nn.Module):
             self.residual = nn.Identity()
 
         self.prelu = nn.PReLU()
+        self.last_attention = None
 
-    def forward(self, x):
+    def forward(self, x, return_attention=False):
         res = self.residual(x)
         x_physical = self.gcn(x)
-        x_semantic = self.spatial_attention(x)
+        if return_attention:
+            x_semantic, attn_info = self.spatial_attention(x, return_attention=True)
+            self.last_attention = attn_info
+        else:
+            x_semantic = self.spatial_attention(x, return_attention=False)
+            self.last_attention = None
         x_fused = x_physical + x_semantic
         x_out = self.tcn(x_fused)
-        return self.prelu(x_out + res)
+        x_out = self.prelu(x_out + res)
+        if return_attention:
+            return x_out, attn_info
+        return x_out
 
 
 class Direction(nn.Module):
@@ -733,7 +758,7 @@ class Model(nn.Module):
         
 
     
-    def encode_past_motion(self,x_input):
+    def encode_past_motion(self,x_input, return_attention=False):
         #x_input: [t_full, bs, V*C]
        
         # [t_full, bs, V*C] -> [t_full, bs, V, C] -> [bs, c, t_full, v]
@@ -757,10 +782,16 @@ class Model(nn.Module):
         x = x_pad # [N, C, T, V] =[16,3,20,14] 关节点= 14 ouput_len = 20
         
         #每次变化的维度只有坐标维度
+        last_encoder_st_gat_attention = None
         for gcn in (self.st_gcnns_encoder_past_motion): #0-3 layer
-            x = gcn(x)
+            if return_attention and isinstance(gcn, ST_GAT_layer):
+                x, attn_info = gcn(x, return_attention=True)
+                last_encoder_st_gat_attention = attn_info
+            else:
+                x = gcn(x)
         N, C, T, V = x.shape # [16, 128, 20, 14]
-        
+        if return_attention:
+            return x, last_encoder_st_gat_attention
         return x
 
     def decoding(self,z,condition=None):
@@ -838,10 +869,15 @@ class Model(nn.Module):
         mapped_noise = self.structure_proj(joint_noise)
         return mapped_noise
 
-    def forward(self, x, z=None,epoch=None):
+    def forward(self, x, z=None,epoch=None, return_attention=False, attention_save_path=None):
         bs = x.shape[1]
         #将编码后的Z进行重复，生成多个候选预测（nk表示候选预测的数量）
-        z = self.encode_past_motion(x).repeat_interleave(self.nk,dim=0)
+        if return_attention:
+            z_encoded, last_encoder_st_gat_attention = self.encode_past_motion(x, return_attention=True)
+        else:
+            z_encoded = self.encode_past_motion(x, return_attention=False)
+            last_encoder_st_gat_attention = None
+        z = z_encoded.repeat_interleave(self.nk,dim=0)
 
         #构建锚点参数并将其扩展为适合批处理的形状，生成 anchors_input 。这些锚点作为潜在空间中的参考点，用于引导不同的动作预测方向。
         replicated_parameters = torch.cat([self.anchor_input[f'anchor_{i}'].expand(self.nk//self.num_anchor, -1) for i in range(self.num_anchor)], dim=0)
@@ -867,7 +903,22 @@ class Model(nn.Module):
 
         
         outputs = self.decoding(feature, x)
-       
+        if return_attention:
+            attention_info = {
+                'last_encoder_st_gat_attn': None,
+                'last_encoder_st_gat_attn_temporal': None,
+            }
+            if last_encoder_st_gat_attention is not None:
+                attn_spatial = last_encoder_st_gat_attention['attn_spatial'].detach()
+                attn_temporal = last_encoder_st_gat_attention['attn_temporal'].detach()
+                attention_info['last_encoder_st_gat_attn'] = attn_spatial
+                attention_info['last_encoder_st_gat_attn_temporal'] = attn_temporal
+                if attention_save_path is not None:
+                    save_dir = os.path.dirname(attention_save_path)
+                    if save_dir != '':
+                        os.makedirs(save_dir, exist_ok=True)
+                    np.save(attention_save_path, attn_spatial.cpu().numpy())
+            return outputs, feature, feature, attention_info
         return outputs , feature, feature
     
    

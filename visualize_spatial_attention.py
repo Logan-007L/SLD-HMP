@@ -12,6 +12,67 @@ from motion_pred.utils.dataset_humaneva_multimodal import DatasetHumanEva
 from models.motion_pred import get_model
 
 
+def sanitize_name(name):
+    return ''.join(ch if ch.isalnum() or ch in ['-', '_'] else '_' for ch in str(name))
+
+
+def get_joint_name_map(dataset_name):
+    if dataset_name == 'h36m':
+        # original h36m indices -> names (aligned with kept_joints used by this project)
+        return {
+            0: 'Hip',
+            1: 'RHip',
+            2: 'RKnee',
+            3: 'RFoot',
+            6: 'LHip',
+            7: 'LKnee',
+            8: 'LFoot',
+            12: 'Spine',
+            13: 'Thorax',
+            14: 'Neck',
+            15: 'Head',
+            17: 'LShoulder',
+            18: 'LElbow',
+            19: 'LWrist',
+            25: 'RShoulder',
+            26: 'RElbow',
+            27: 'RWrist',
+        }
+    if dataset_name == 'humaneva':
+        # original humaneva indices -> names
+        return {
+            0: 'Hip',
+            1: 'Torso',
+            2: 'LHip',
+            3: 'LKnee',
+            4: 'LFoot',
+            5: 'RHip',
+            6: 'RKnee',
+            7: 'RFoot',
+            8: 'LShoulder',
+            9: 'LElbow',
+            10: 'LWrist',
+            11: 'RShoulder',
+            12: 'RElbow',
+            13: 'RWrist',
+            14: 'Head',
+        }
+    return {}
+
+
+def build_joint_labels(cfg, dataset, num_joints):
+    # Model uses non-root joints: dataset.kept_joints[1:]
+    if hasattr(dataset, 'kept_joints') and len(dataset.kept_joints) >= num_joints + 1:
+        used_joint_ids = [int(x) for x in dataset.kept_joints[1:1 + num_joints]]
+    else:
+        used_joint_ids = list(range(1, num_joints + 1))
+    name_map = get_joint_name_map(cfg.dataset)
+    labels = [name_map.get(jid, f'J{jid}') for jid in used_joint_ids]
+    if len(labels) != num_joints:
+        labels = [f'J{i}' for i in range(num_joints)]
+    return labels
+
+
 def build_dataset(cfg, split):
     dataset_cls = DatasetH36M if cfg.dataset == 'h36m' else DatasetHumanEva
     kwargs = {}
@@ -99,6 +160,7 @@ def main():
     parser.add_argument('--seed', type=int, default=1)
     parser.add_argument('--save_npy', type=str, default=None, help='保存 [B,H,V,V] 的注意力矩阵路径')
     parser.add_argument('--save_fig', type=str, default=None, help='保存热力图路径')
+    parser.add_argument('--hide_joint_labels', action='store_true', help='隐藏坐标轴关节名称标签')
     args = parser.parse_args()
     try:
         import matplotlib
@@ -131,8 +193,9 @@ def main():
 
     default_dir = os.path.join(cfg.result_dir, 'attention_maps')
     os.makedirs(default_dir, exist_ok=True)
-    default_npy = os.path.join(default_dir, f'{args.cfg}_{args.split}_{action}_idx{args.sample_index}_start{start}_attn.npy')
-    default_fig = os.path.join(default_dir, f'{args.cfg}_{args.split}_{action}_idx{args.sample_index}_start{start}_heatmap.png')
+    action_safe = sanitize_name(action)
+    default_npy = os.path.join(default_dir, f'{args.cfg}_{args.split}_{action_safe}_idx{args.sample_index}_start{start}_attn.npy')
+    default_fig = os.path.join(default_dir, f'{args.cfg}_{args.split}_{action_safe}_idx{args.sample_index}_start{start}_heatmap.png')
     save_npy = args.save_npy if args.save_npy else default_npy
     save_fig = args.save_fig if args.save_fig else default_fig
 
@@ -165,10 +228,19 @@ def main():
     plt.colorbar(im, fraction=0.046, pad=0.04)
     v = heatmap.shape[0]
     ticks = np.arange(v)
-    plt.xticks(ticks)
-    plt.yticks(ticks)
-    plt.xlabel('Key joint index')
-    plt.ylabel('Query joint index')
+    if args.hide_joint_labels:
+        plt.xticks(ticks)
+        plt.yticks(ticks)
+    else:
+        joint_labels = build_joint_labels(cfg, dataset, v)
+        plt.xticks(ticks, joint_labels, rotation=45, ha='right', fontsize=8)
+        plt.yticks(ticks, joint_labels, fontsize=8)
+    if args.hide_joint_labels:
+        plt.xlabel('Key joint index')
+        plt.ylabel('Query joint index')
+    else:
+        plt.xlabel('Key joint name')
+        plt.ylabel('Query joint name')
     plt.title(f'Spatial Attention Heatmap ({action}, {time_desc}, V={v})')
     plt.tight_layout()
     plt.savefig(save_fig, dpi=220)

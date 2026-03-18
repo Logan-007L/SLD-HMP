@@ -43,6 +43,11 @@ python main.py --cfg [h36m/humaneva] --gpu_index 0
  python main.py --cfg [h36m/humaneva] --mode viz --iter 500 --gpu_index 0
   ```
 
+### Spatial Attention Heatmap
+For ST-GAT spatial attention visualization (heatmap, top-k cross-joint links, and time sweep), please refer to:
+
+- [docs/ATTENTION_HEATMAP_README.md](docs/ATTENTION_HEATMAP_README.md)
+
  ### Acknowledgments
  
  This code is based on the implementations of [STARS](https://github.com/Sirui-Xu/STARS).
